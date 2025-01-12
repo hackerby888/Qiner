@@ -396,3 +396,10 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+cmake_install.cmake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+Qiner
+Qiner.exe

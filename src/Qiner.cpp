@@ -1,3 +1,5 @@
+#include <iostream>
+#include "json.hpp"
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -10,7 +12,7 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #include <winsock2.h>
-#pragma comment (lib, "ws2_32.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 #else
 #include <signal.h>
@@ -24,8 +26,10 @@
 #include "K12AndKeyUtil.h"
 #include "keyUtils.h"
 
+using json = nlohmann::json;
+using namespace std;
 
-void random(unsigned char* publicKey, unsigned char* nonce, unsigned char* output, unsigned int outputSize)
+void random(unsigned char *publicKey, unsigned char *nonce, unsigned char *output, unsigned int outputSize)
 {
     unsigned char state[200];
     memcpy(&state[0], publicKey, 32);
@@ -45,7 +49,7 @@ void random(unsigned char* publicKey, unsigned char* nonce, unsigned char* outpu
     }
 }
 
-void random2(unsigned char* publicKey, unsigned char* nonce, unsigned char* output, unsigned int outputSize) // outputSize must be a multiple of 8
+void random2(unsigned char *publicKey, unsigned char *nonce, unsigned char *output, unsigned int outputSize) // outputSize must be a multiple of 8
 {
     unsigned char state[200];
     memcpy(&state[0], publicKey, 32);
@@ -54,7 +58,7 @@ void random2(unsigned char* publicKey, unsigned char* nonce, unsigned char* outp
 
     // Data on heap to avoid stack overflow for some compiler
     std::vector<unsigned char> poolVec(1048576 + 24); // Need a multiple of 200
-    unsigned char* pool = poolVec.data();
+    unsigned char *pool = poolVec.data();
 
     for (unsigned int i = 0; i < poolVec.size(); i += sizeof(state))
     {
@@ -65,109 +69,110 @@ void random2(unsigned char* publicKey, unsigned char* nonce, unsigned char* outp
     unsigned int x = 0; // The same sequence is always used, exploit this for optimization
     for (unsigned long long i = 0; i < outputSize; i += 8)
     {
-        *((unsigned long long*) & output[i]) = *((unsigned long long*) & pool[x & (1048576 - 1)]);
+        *((unsigned long long *)&output[i]) = *((unsigned long long *)&pool[x & (1048576 - 1)]);
         x = x * 1664525 + 1013904223; // https://en.wikipedia.org/wiki/Linear_congruential_generator#Parameters_in_common_use
     }
 }
 
-struct RequestResponseHeader
-{
-private:
-    unsigned char _size[3];
-    unsigned char _type;
-    unsigned int _dejavu;
-
-public:
-    inline unsigned int size()
-    {
-        return (*((unsigned int*)_size)) & 0xFFFFFF;
-    }
-
-    inline void setSize(unsigned int size)
-    {
-        _size[0] = (unsigned char)size;
-        _size[1] = (unsigned char)(size >> 8);
-        _size[2] = (unsigned char)(size >> 16);
-    }
-
-    inline bool isDejavuZero() const
-    {
-        return !_dejavu;
-    }
-
-    inline void zeroDejavu()
-    {
-        _dejavu = 0;
-    }
-
-
-    inline unsigned int dejavu() const
-    {
-        return _dejavu;
-    }
-
-    inline void setDejavu(unsigned int dejavu)
-    {
-        _dejavu = dejavu;
-    }
-
-    inline void randomizeDejavu()
-    {
-        _rdrand32_step(&_dejavu);
-        if (!_dejavu)
-        {
-            _dejavu = 1;
-        }
-    }
-
-    inline unsigned char type() const
-    {
-        return _type;
-    }
-
-    inline void setType(const unsigned char type)
-    {
-        _type = type;
-    }
-};
-
-#define BROADCAST_MESSAGE 1
-
-typedef struct
-{
-    unsigned char sourcePublicKey[32];
-    unsigned char destinationPublicKey[32];
-    unsigned char gammingNonce[32];
-} Message;
-
-char* nodeIp = NULL;
+char *nodeIp = NULL;
 int nodePort = 0;
 static constexpr unsigned long long DATA_LENGTH = 256;
 static constexpr unsigned long long NUMBER_OF_HIDDEN_NEURONS = 3000;
 static constexpr unsigned long long NUMBER_OF_NEIGHBOR_NEURONS = 3000;
-static constexpr unsigned long long MAX_DURATION = 3000*3000;
-static constexpr unsigned long long NUMBER_OF_OPTIMIZATION_STEPS = 30;
+static constexpr unsigned long long MAX_DURATION = 9000000;
+static constexpr unsigned long long NUMBER_OF_OPTIMIZATION_STEPS = 60;
 static constexpr unsigned int SOLUTION_THRESHOLD = 87;
 
-static_assert(((DATA_LENGTH + NUMBER_OF_HIDDEN_NEURONS + DATA_LENGTH)* NUMBER_OF_NEIGHBOR_NEURONS) % 64 == 0, "Synapse size need to be a multipler of 64");
+static int SUBSCRIBE = 1;
+static int NEW_COMPUTOR_ID = 2;
+static int NEW_SEED = 3;
+static int SUBMIT = 4;
+static int REPORT_HASHRATE = 5;
+static int NEW_DIFFICULTY = 6;
+
+static_assert(((DATA_LENGTH + NUMBER_OF_HIDDEN_NEURONS + DATA_LENGTH) * NUMBER_OF_NEIGHBOR_NEURONS) % 64 == 0, "Synapse size need to be a multipler of 64");
 static_assert(NUMBER_OF_OPTIMIZATION_STEPS < MAX_DURATION, "Number of retries need to smaller than MAX_DURATION");
+
+// qatum variable
+
+static std::atomic<int> difficulty(0);
+static unsigned char computorPublicKey[32] = {0};
+static unsigned char randomSeed[32] = {0};
+
+static std::atomic<char> state(0);
+static std::atomic<long long> numberOfMiningIterations(0);
+static std::atomic<unsigned int> numberOfFoundSolutions(0);
+static std::queue<std::array<unsigned char, 32>> foundNonce;
+std::mutex foundNonceLock;
+
+template <unsigned long long num>
+bool isZeros(const unsigned char *value)
+{
+    bool allZeros = true;
+    for (unsigned long long i = 0; i < num; ++i)
+    {
+        if (value[i] != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct Miner
 {
     long long data[DATA_LENGTH];
     unsigned char computorPublicKey[32];
     unsigned char currentRandomSeed[32];
+    int difficulty;
 
     void initialize(unsigned char randomSeed[32])
     {
-        random(randomSeed, randomSeed, (unsigned char*)data, sizeof(data));
+        random(randomSeed, randomSeed, (unsigned char *)data, sizeof(data));
         for (unsigned long long i = 0; i < DATA_LENGTH; i++)
         {
             data[i] = (data[i] >= 0 ? 1 : -1);
         }
 
-        memcpy(currentRandomSeed, randomSeed, sizeof(currentRandomSeed));
-        memset(computorPublicKey, 0, sizeof(computorPublicKey));
+        memcpy(this->currentRandomSeed, randomSeed, sizeof(currentRandomSeed));
+        memset(this->computorPublicKey, 0, sizeof(computorPublicKey));
+    }
+
+    bool updateLatestQatumData()
+    {
+        memcpy(this->currentRandomSeed, ::randomSeed, sizeof(currentRandomSeed));
+        memcpy(this->computorPublicKey, ::computorPublicKey, sizeof(computorPublicKey));
+        this->difficulty = ::difficulty;
+
+        random(randomSeed, randomSeed, (unsigned char *)data, sizeof(data));
+        for (unsigned long long i = 0; i < DATA_LENGTH; i++)
+        {
+            data[i] = (data[i] >= 0 ? 1 : -1);
+        }
+
+        setComputorPublicKey(computorPublicKey);
+
+        return !isZeros<32>(this->computorPublicKey) && !isZeros<32>(this->currentRandomSeed) && this->difficulty != 0;
+    }
+
+    static bool checkGlobalQatumDataAvailability()
+    {
+        return !isZeros<32>(::computorPublicKey) && !isZeros<32>(::randomSeed) && ::difficulty != 0;
+    }
+
+    void setCurrentDifficulty(int difficulty)
+    {
+        this->difficulty = difficulty;
+    }
+
+    int getCurrentDifficulty()
+    {
+        return this->difficulty;
+    }
+
+    void getCurrentRandomSeed(unsigned char randomSeed[32])
+    {
+        memcpy(randomSeed, this->currentRandomSeed, sizeof(this->currentRandomSeed));
     }
 
     void getComputorPublicKey(unsigned char computorPublicKey[32])
@@ -201,11 +206,11 @@ struct Miner
     // Main function for mining
     bool findSolution(unsigned char nonce[32])
     {
-        _rdrand64_step((unsigned long long*)&nonce[0]);
-        _rdrand64_step((unsigned long long*)&nonce[8]);
-        _rdrand64_step((unsigned long long*)&nonce[16]);
-        _rdrand64_step((unsigned long long*)&nonce[24]);
-        random2(computorPublicKey, nonce, (unsigned char*)&synapses, sizeof(synapses));
+        _rdrand64_step((unsigned long long *)&nonce[0]);
+        _rdrand64_step((unsigned long long *)&nonce[8]);
+        _rdrand64_step((unsigned long long *)&nonce[16]);
+        _rdrand64_step((unsigned long long *)&nonce[24]);
+        random2(computorPublicKey, nonce, (unsigned char *)&synapses, sizeof(synapses));
 
         unsigned int score = 0;
         long long tailTick = MAX_DURATION - 1;
@@ -312,7 +317,7 @@ struct Miner
             {
                 score = currentScore;
                 // For the first run, don't need to update the skipped ticks list
-                if (skipTick != -1 )
+                if (skipTick != -1)
                 {
                     skipTicks[numberOfSkippedTicks] = skipTick;
                     numberOfSkippedTicks++;
@@ -326,11 +331,9 @@ struct Miner
             // the skipTick is still not duplicated with previous ones.
             ticksNumbers[randomTick] = ticksNumbers[tailTick];
             tailTick--;
-
         }
-
         // Check score
-        if (score >= SOLUTION_THRESHOLD)
+        if (score >= difficulty)
         {
             return true;
         }
@@ -338,16 +341,6 @@ struct Miner
         return false;
     }
 };
-
-static std::atomic<char> state(0);
-
-static unsigned char computorPublicKey[32];
-static unsigned char randomSeed[32];
-static std::atomic<long long> numberOfMiningIterations(0);
-static std::atomic<unsigned int> numberOfFoundSolutions(0);
-static std::queue<std::array<unsigned char, 32>> foundNonce;
-std::mutex foundNonceLock;
-
 
 #ifdef _MSC_VER
 static BOOL WINAPI ctrlCHandlerRoutine(DWORD dwCtrlType)
@@ -393,20 +386,6 @@ int getSystemProcs()
     return 0;
 }
 
-template<unsigned long long num>
-bool isZeros(const unsigned char* value)
-{
-    bool allZeros = true;
-    for (unsigned long long i = 0; i < num; ++i)
-    {
-        if (value[i] != 0)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 int miningThreadProc()
 {
     std::unique_ptr<Miner> miner(new Miner());
@@ -416,16 +395,24 @@ int miningThreadProc()
     std::array<unsigned char, 32> nonce;
     while (!state)
     {
-        if (miner->findSolution(nonce.data()))
+        if (miner->updateLatestQatumData())
         {
+            if (miner->findSolution(nonce.data()))
             {
-                std::lock_guard<std::mutex> guard(foundNonceLock);
-                foundNonce.push(nonce);
+                {
+                    std::lock_guard<std::mutex> guard(foundNonceLock);
+                    foundNonce.push(nonce);
+                }
+                numberOfFoundSolutions++;
             }
-            numberOfFoundSolutions++;
-        }
 
-        numberOfMiningIterations++;
+            numberOfMiningIterations++;
+        }
+        else
+        {
+            // no data to mine
+            std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(1000));
+        }
     }
     return 0;
 }
@@ -449,7 +436,7 @@ struct ServerSocket
         closesocket(serverSocket);
     }
 
-    bool establishConnection(char* address)
+    bool establishConnection(char *address)
     {
         serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (serverSocket == INVALID_SOCKET)
@@ -463,7 +450,7 @@ struct ServerSocket
         addr.sin_family = AF_INET;
         addr.sin_port = htons(nodePort);
         sscanf_s(address, "%hhu.%hhu.%hhu.%hhu", &addr.sin_addr.S_un.S_un_b.s_b1, &addr.sin_addr.S_un.S_un_b.s_b2, &addr.sin_addr.S_un.S_un_b.s_b3, &addr.sin_addr.S_un.S_un_b.s_b4);
-        if (connect(serverSocket, (const sockaddr*)&addr, sizeof(addr)))
+        if (connect(serverSocket, (const sockaddr *)&addr, sizeof(addr)))
         {
             printf("Fail to connect to %d.%d.%d.%d (%d)!\n", addr.sin_addr.S_un.S_un_b.s_b1, addr.sin_addr.S_un.S_un_b.s_b2, addr.sin_addr.S_un.S_un_b.s_b3, addr.sin_addr.S_un.S_un_b.s_b4, WSAGetLastError());
             closeConnection();
@@ -479,7 +466,7 @@ struct ServerSocket
     {
         close(serverSocket);
     }
-    bool establishConnection(char* address)
+    bool establishConnection(char *address)
     {
         serverSocket = socket(AF_INET, SOCK_STREAM, 0);
         if (serverSocket == -1)
@@ -487,7 +474,11 @@ struct ServerSocket
             printf("Fail to create a socket (%d)!\n", errno);
             return false;
         }
-
+        timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        setsockopt(serverSocket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+        setsockopt(serverSocket, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
         sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
@@ -498,7 +489,7 @@ struct ServerSocket
             return false;
         }
 
-        if (connect(serverSocket, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+        if (connect(serverSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
         {
             printf("Fail to connect to %s (%d)\n", address, errno);
             closeConnection();
@@ -511,7 +502,7 @@ struct ServerSocket
     int serverSocket;
 #endif
 
-    bool sendData(char* buffer, unsigned int size)
+    bool sendData(char *buffer, unsigned int size)
     {
         while (size)
         {
@@ -526,80 +517,164 @@ struct ServerSocket
 
         return true;
     }
-    bool receiveData(char* buffer, unsigned int size)
+    int receiveData(uint8_t *buffer, int sz)
     {
-        const auto beginningTime = std::chrono::steady_clock::now();
-        unsigned long long deltaTime = 0;
-        while (size && deltaTime <= 2000)
+        return recv(serverSocket, (char *)buffer, sz, 0);
+    }
+
+    bool receiveDataAll(std::vector<uint8_t> &receivedData)
+    {
+        receivedData.resize(0);
+        uint8_t tmp[1024];
+        int recvByte = receiveData(tmp, 1024);
+        while (recvByte > 0)
         {
-            int numberOfBytes;
-            if ((numberOfBytes = recv(serverSocket, buffer, size, 0)) <= 0)
-            {
-                return false;
-            }
-            buffer += numberOfBytes;
-            size -= numberOfBytes;
-            deltaTime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - beginningTime).count();
+            receivedData.resize(recvByte + receivedData.size());
+            memcpy(receivedData.data() + receivedData.size() - recvByte, tmp, recvByte);
+            recvByte = receiveData(tmp, 1024);
+        }
+        if (receivedData.size() == 0)
+        {
+            return false;
         }
 
         return true;
     }
 };
 
-static void hexToByte(const char* hex, uint8_t* byte, const int sizeInByte)
+static void hexToByte(const char *hex, uint8_t *byte, const int sizeInByte)
 {
-    for (int i = 0; i < sizeInByte; i++){
-        sscanf(hex+i*2, "%2hhx", &byte[i]);
+    for (int i = 0; i < sizeInByte; i++)
+    {
+        sscanf(hex + i * 2, "%2hhx", &byte[i]);
+    }
+}
+static void byteToHex(const uint8_t *byte, char *hex, const int sizeInByte)
+{
+    for (int i = 0; i < sizeInByte; i++)
+    {
+        sprintf(hex + i * 2, "%02x", byte[i]);
     }
 }
 
-int main(int argc, char* argv[])
+void handleQatumData(std::string data)
 {
-    std::vector<std::thread> miningThreads;
-    if (argc != 7)
+    json j = json::parse(data);
+    int id = j["id"];
+    if (id == SUBSCRIBE)
     {
-        printf("Usage:   Qiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Mining Seed] [Number of threads]\n");
+        bool result = j["result"];
+        if (!result)
+        {
+            std::cout << "Failed to connect to Qatum server " << j["error"] << std::endl;
+            state = 1;
+        }
+        else
+        {
+            std::cout << "Connected to Qatum server" << std::endl;
+        }
+    }
+    else if (id == NEW_COMPUTOR_ID)
+    {
+        string computorId = j["computorId"];
+        getPublicKeyFromIdentity((char *)computorId.c_str(), computorPublicKey);
+    }
+    else if (id == NEW_SEED)
+    {
+        string seed = j["seed"];
+        hexToByte(seed.c_str(), randomSeed, 32);
+    }
+    else if (id == NEW_DIFFICULTY)
+    {
+        int diff = j["difficulty"];
+        difficulty = diff;
+    }
+    else if (id == SUBMIT)
+    {
+        bool result = j["result"];
+        if (!result)
+        {
+            cout << "Failed to submit nonce " << j["error"] << endl;
+        }
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    char miningID[61];
+    miningID[60] = 0;
+    string qatumBuffer = "";
+    std::vector<std::thread> miningThreads;
+    if (argc != 6)
+    {
+        printf("Usage:   Qiner [Qatum IP] [Qatum Port] [Wallet] [Worker] [Threads]\n");
     }
     else
     {
         nodeIp = argv[1];
         nodePort = std::atoi(argv[2]);
-        char* miningID = argv[3];
+        char *wallet = argv[3];
+        char *worker = argv[4];
         printf("Qiner is launched. Connecting to %s:%d\n", nodeIp, nodePort);
 
-        consoleCtrlHandler();
+        json j;
+        j["id"] = 1;
+        j["wallet"] = wallet;
+        j["worker"] = worker;
+        std::string s = j.dump() + "\n";
+        char *buffer = new char[s.size()];
+        strcpy(buffer, s.c_str());
+        ServerSocket serverSocket;
+        bool ok = serverSocket.establishConnection(nodeIp);
+        if (!ok)
+        {
+            printf("Failed to connect to Qatum server\n");
+            return 1;
+        }
+        serverSocket.sendData(buffer, s.size());
+        delete[] buffer;
+
+        //  consoleCtrlHandler();
 
         {
-            getPublicKeyFromIdentity(miningID, computorPublicKey);
-
-            // Data for signing the solution
-            char* signingSeed = argv[4];
-            unsigned char signingPrivateKey[32];
-            unsigned char signingSubseed[32];
-            unsigned char signingPublicKey[32];
-            char privateKeyQubicFormat[128] = {0};
-            char publicKeyQubicFormat[128] = {0};
-            char publicIdentity[128] = {0};
-            getSubseedFromSeed((unsigned char*)signingSeed, signingSubseed);
-            getPrivateKeyFromSubSeed(signingSubseed, signingPrivateKey);
-            getPublicKeyFromPrivateKey(signingPrivateKey, signingPublicKey);
-
-            //getIdentityFromPublicKey(signingPublicKey, miningID, false);
-
-            hexToByte(argv[5], randomSeed, 32);
-            unsigned int numberOfThreads = atoi(argv[6]);
-            printf("%d threads are used.\n", numberOfThreads);
+            unsigned int numberOfThreads = atoi(argv[5]);
             miningThreads.resize(numberOfThreads);
-            for (unsigned int i = numberOfThreads; i-- > 0; )
+            for (unsigned int i = numberOfThreads; i-- > 0;)
             {
                 miningThreads.emplace_back(miningThreadProc);
             }
-            ServerSocket serverSocket;
 
             auto timestamp = std::chrono::steady_clock::now();
             long long prevNumberOfMiningIterations = 0;
+            long long lastIts = 0;
+            unsigned long long loopCount = 0;
             while (!state)
             {
+                if (loopCount % 30 == 0 && loopCount > 0)
+                {
+                    json j;
+                    j["id"] = REPORT_HASHRATE;
+                    j["computorId"] = miningID;
+                    j["hashrate"] = 10;
+                    string buffer = j.dump() + "\n";
+                    serverSocket.sendData((char *)buffer.c_str(), buffer.size());
+                }
+
+                // receive data
+                std::vector<uint8_t> receivedData;
+                serverSocket.receiveDataAll(receivedData);
+                std::string str(receivedData.begin(), receivedData.end());
+                qatumBuffer += str;
+
+                while (qatumBuffer.find("\n") != std::string::npos)
+                {
+                    std::string data = qatumBuffer.substr(0, qatumBuffer.find("\n"));
+                    handleQatumData(data);
+                    qatumBuffer = qatumBuffer.substr(qatumBuffer.find("\n") + 1);
+                }
+
+                getIdentityFromPublicKey(computorPublicKey, miningID, false);
+
                 bool haveNonceToSend = false;
                 size_t itemToSend = 0;
                 std::array<unsigned char, 32> sendNonce;
@@ -612,99 +687,67 @@ int main(int argc, char* argv[])
                     }
                     itemToSend = foundNonce.size();
                 }
+
                 if (haveNonceToSend)
                 {
-                    if (serverSocket.establishConnection(nodeIp))
-                    {
-                        struct
-                        {
-                            RequestResponseHeader header;
-                            Message message;
-                            unsigned char solutionMiningSeed[32];
-                            unsigned char solutionNonce[32];
-                            unsigned char signature[64];
-                        } packet;
-
-                        packet.header.setSize(sizeof(packet));
-                        packet.header.zeroDejavu();
-                        packet.header.setType(BROADCAST_MESSAGE);
-
-                        memcpy(packet.message.sourcePublicKey, signingPublicKey, sizeof(packet.message.sourcePublicKey));
-                        memcpy(packet.message.destinationPublicKey, computorPublicKey, sizeof(packet.message.destinationPublicKey));
-
-                        unsigned char sharedKeyAndGammingNonce[64];
-                        // Default behavior when provided seed is just a signing address
-                        // first 32 bytes of sharedKeyAndGammingNonce is set as zeros
-                        memset(sharedKeyAndGammingNonce, 0, 32);
-                        // If provided seed is the for computor public key, generate sharedKey into first 32 bytes to encrypt message
-                        if (memcmp(computorPublicKey, signingPublicKey, 32) == 0)
-                        {
-                            getSharedKey(signingPrivateKey, computorPublicKey, sharedKeyAndGammingNonce);
-                        }
-                        // Last 32 bytes of sharedKeyAndGammingNonce is randomly created so that gammingKey[0] = 0 (MESSAGE_TYPE_SOLUTION)
-                        unsigned char gammingKey[32];
-                        do
-                        {
-                            _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[0]);
-                            _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[8]);
-                            _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[16]);
-                            _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[24]);
-                            memcpy(&sharedKeyAndGammingNonce[32], packet.message.gammingNonce, 32);
-                            KangarooTwelve(sharedKeyAndGammingNonce, 64, gammingKey, 32);
-                        } while (gammingKey[0]);
-
-                        // Encrypt the message payload
-                        unsigned char gamma[32 + 32];
-                        KangarooTwelve(gammingKey, sizeof(gammingKey), gamma, sizeof(gamma));
-                        for (unsigned int i = 0; i < 32; i++)
-                        {
-                            packet.solutionMiningSeed[i] = randomSeed[i] ^ gamma[i];
-                            packet.solutionNonce[i] = sendNonce[i] ^ gamma[i + 32];
-                        }
-
-                        // Sign the message
-                        uint8_t digest[32] = {0};
-                        uint8_t signature[64] = {0};
-                        KangarooTwelve(
-                            (unsigned char*)&packet + sizeof(RequestResponseHeader),
-                            sizeof(packet) - sizeof(RequestResponseHeader) - 64,
-                            digest,
-                            32);
-                        sign(signingSubseed, signingPublicKey, digest, signature);
-                        memcpy(packet.signature, signature, 64);
-
-                        // Send message
-                        if (serverSocket.sendData((char*)&packet, packet.header.size()))
-                        {
-                            std::lock_guard<std::mutex> guard(foundNonceLock);
-                            // Send data successfully. Remove it from the queue
-                            foundNonce.pop();
-                            itemToSend = foundNonce.size();
-                        }
-                        serverSocket.closeConnection();
-                    }
+                    char nonceHex[65];
+                    char seedHex[65];
+                    char id[61];
+                    id[60] = 0;
+                    nonceHex[65] = 0;
+                    seedHex[65] = 0;
+                    getIdentityFromPublicKey(computorPublicKey, id, false);
+                    byteToHex(sendNonce.data(), nonceHex, 32);
+                    byteToHex(randomSeed, seedHex, 32);
+                    json j;
+                    j["id"] = SUBMIT;
+                    j["nonce"] = nonceHex;
+                    j["seed"] = seedHex;
+                    j["computorId"] = id;
+                    string buffer = j.dump() + "\n";
+                    serverSocket.sendData((char *)buffer.c_str(), buffer.size());
+                    foundNonce.pop();
                 }
-
-                std::this_thread::sleep_for(std::chrono::duration < double, std::milli>(1000));
 
                 unsigned long long delta = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - timestamp).count();
                 if (delta >= 1000)
                 {
-                    // Get current time in UTC
-                    std::time_t now_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                    std::tm* utc_time = std::gmtime(&now_time);
-                    printf("|   %04d-%02d-%02d %02d:%02d:%02d   |   %llu it/s   |   %d solutions   |   %.10s...   |\n",
-                        utc_time->tm_year + 1900, utc_time->tm_mon, utc_time->tm_mday, utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec,
-                        (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta, numberOfFoundSolutions.load(), miningID);
-                    prevNumberOfMiningIterations = numberOfMiningIterations;
-                    timestamp = std::chrono::steady_clock::now();
+                    if (Miner::checkGlobalQatumDataAvailability())
+                    {
+                        lastIts = (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta;
+                        // Get current time in UTC
+                        std::time_t now_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                        std::tm *utc_time = std::gmtime(&now_time);
+                        printf("|   %04d-%02d-%02d %02d:%02d:%02d   |   %llu it/s   |   %d solutions   |   %.7s...%.7s   |   Difficulty %d   |\n",
+                               utc_time->tm_year + 1900, utc_time->tm_mon, utc_time->tm_mday, utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec,
+                               lastIts, numberOfFoundSolutions.load(), miningID, miningID + (60 - 7), difficulty.load());
+                        prevNumberOfMiningIterations = numberOfMiningIterations;
+                        timestamp = std::chrono::steady_clock::now();
+                    }
+                    else
+                    {
+                        if (isZeros<32>(computorPublicKey))
+                        {
+                            printf("Waiting for computor public key...\n");
+                        }
+                        else if (isZeros<32>(randomSeed))
+                        {
+                            printf("Waiting for random seed, we are idle now...\n");
+                        }
+                        else if (difficulty == 0)
+                        {
+                            printf("Waiting for difficulty...\n");
+                        }
+                    }
                 }
+                std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(1000));
+                loopCount++;
             }
         }
         printf("Shutting down...Press Ctrl+C again to force stop.\n");
 
         // Wait for all threads to join
-        for (auto& miningTh : miningThreads)
+        for (auto &miningTh : miningThreads)
         {
             if (miningTh.joinable())
             {
