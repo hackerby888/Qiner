@@ -694,8 +694,8 @@ int main(int argc, char *argv[])
                     char seedHex[65];
                     char id[61];
                     id[60] = 0;
-                    nonceHex[65] = 0;
-                    seedHex[65] = 0;
+                    nonceHex[64] = 0;
+                    seedHex[64] = 0;
                     getIdentityFromPublicKey(computorPublicKey, id, false);
                     byteToHex(sendNonce.data(), nonceHex, 32);
                     byteToHex(randomSeed, seedHex, 32);
@@ -720,7 +720,7 @@ int main(int argc, char *argv[])
                         std::tm *utc_time = std::gmtime(&now_time);
                         printf("|   %04d-%02d-%02d %02d:%02d:%02d   |   %llu it/s   |   %d solutions   |   %.7s...%.7s   |   Difficulty %d   |\n",
                                utc_time->tm_year + 1900, utc_time->tm_mon, utc_time->tm_mday, utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec,
-                               lastIts, numberOfFoundSolutions.load(), miningID, miningID + (60 - 7), difficulty.load());
+                               lastIts, numberOfFoundSolutions.load(), miningID, &miningID[53], difficulty.load());
                         prevNumberOfMiningIterations = numberOfMiningIterations;
                         timestamp = std::chrono::steady_clock::now();
                     }
