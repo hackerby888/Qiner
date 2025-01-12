@@ -1,5 +1,5 @@
 # Qubic Reference Miner
-This Repo contains the reference implementation of the algoritm used in Qubic.
+This Repo contains the reference implementation of the algoritm used in Qubic and Qatum mining protocol.
 
 # Requirement
 - CPU: support at least AVX2 instruction set
@@ -74,7 +74,7 @@ CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=1
 
 # Run
 ```
-Qiner <IP> <Identity> [<number of threads>]
+Qiner [Qatum IP] [Qatum Port] [Wallet] [Worker] [Threads]
 ```
 - number of threads:  Optional, if not parse default number of cores will be used
 
