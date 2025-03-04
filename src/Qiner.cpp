@@ -616,11 +616,34 @@ int getSystemProcs()
     return 0;
 }
 
-int miningThreadProc()
+// Batch size for atomic updates - larger for better performance
+const int UPDATE_BATCH = 100;
+
+// Set thread affinity for better cache utilization
+void setThreadAffinity(int threadId)
 {
+#ifdef _MSC_VER
+    SetThreadAffinityMask(GetCurrentThread(), 1ULL << (threadId % 64));
+#else
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(threadId % CPU_SETSIZE, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+}
+
+int miningThreadProc(int threadId)
+{
+    // Local counter to reduce atomic operations
+    int localIterations = 0;
+    // Set thread affinity for better performance
+    setThreadAffinity(threadId);
     std::unique_ptr<Miner> miner(new Miner());
     miner->initialize(randomSeed);
     miner->setComputorPublicKey(computorPublicKey);
+
+    // Pre-allocate bitmap for efficient skip tick tracking
+    miner->skipTicksBitmap.resize((NUMBER_OF_OPTIMIZATION_STEPS + 63) / 64, 0);
 
     std::array<unsigned char, 32> nonce;
     while (!state)
@@ -636,7 +659,13 @@ int miningThreadProc()
                 numberOfFoundSolutions++;
             }
 
-            numberOfMiningIterations++;
+            localIterations++;
+
+            if (localIterations >= UPDATE_BATCH)
+            {
+                numberOfMiningIterations += localIterations;
+                localIterations = 0;
+            }
         }
         else
         {
@@ -871,7 +900,7 @@ int main(int argc, char *argv[])
             miningThreads.resize(numberOfThreads);
             for (unsigned int i = numberOfThreads; i-- > 0;)
             {
-                miningThreads.emplace_back(miningThreadProc);
+                miningThreads.emplace_back(miningThreadProc, i);
             }
 
             auto timestamp = std::chrono::steady_clock::now();
