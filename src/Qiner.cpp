@@ -655,7 +655,7 @@ int main(int argc, char *argv[])
                     json j;
                     j["id"] = REPORT_HASHRATE;
                     j["computorId"] = miningID;
-                    j["hashrate"] = 10;
+                    j["hashrate"] = lastIts;
                     string buffer = j.dump() + "\n";
                     serverSocket.sendData((char *)buffer.c_str(), buffer.size());
                 }
