@@ -23,6 +23,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Options
+OPTION(BUILD_TOOLS "Build Qiner tools" OFF)
+
 # Main executable
 add_executable(${PROJECT_NAME} src/Qiner.cpp src/keyUtils.cpp)
 
@@ -38,3 +41,7 @@ endif()
 
 # Other projects
 add_subdirectory(test)
+if (BUILD_TOOLS)
+    message(STATUS "Enable build Qiner tools.")
+    add_subdirectory(tools)
+endif()
