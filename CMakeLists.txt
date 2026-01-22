@@ -18,6 +18,11 @@ else()
     message(FATAL "Unsupported compiler.")
 endif()
 
+# Compiled output
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # Main executable
 add_executable(${PROJECT_NAME} src/Qiner.cpp src/keyUtils.cpp)
 
@@ -25,7 +30,11 @@ include_directories(${PROJECT_NAME} ./src)
 
 # Linking
 if(WIN32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
     target_link_libraries(${PROJECT_NAME} wsock32 ws2_32)
 else()
     target_link_libraries(${PROJECT_NAME} pthread)
 endif()
+
+# Other projects
+add_subdirectory(test)
