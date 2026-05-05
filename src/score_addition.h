@@ -11,11 +11,13 @@ namespace score_addition
 
 static constexpr unsigned long long NUMBER_OF_INPUT_NEURONS = 2 * 7; // K
 static constexpr unsigned long long NUMBER_OF_OUTPUT_NEURONS = 8;    // L
-static constexpr unsigned long long NUMBER_OF_TICKS = 120;           // N
-static constexpr unsigned long long MAX_NEIGHBOR_NEURONS = 728;      // 2M. Must divided by 2
+static constexpr unsigned long long NUMBER_OF_TICKS = 120;
 static constexpr unsigned long long NUMBER_OF_MUTATIONS = 100;
-static constexpr unsigned long long POPULATION_THRESHOLD =
-    NUMBER_OF_INPUT_NEURONS + NUMBER_OF_OUTPUT_NEURONS + NUMBER_OF_MUTATIONS; // P
+// Fixed-topology detour: total neuron count is set directly.
+static constexpr unsigned long long POPULATION_THRESHOLD = 32;                  // P
+// Buffer is sized to N. Effective neighbor count clamps to N-1 (self excluded)
+// inside getActualNeighborCount(), keeps maxNumberOfNeighbors even and the existing buffer-center math intact.
+static constexpr unsigned long long MAX_NEIGHBOR_NEURONS = POPULATION_THRESHOLD;
 static constexpr unsigned int SOLUTION_THRESHOLD = ((1ULL << NUMBER_OF_INPUT_NEURONS) * NUMBER_OF_OUTPUT_NEURONS * 4 / 5);
 
 template <
@@ -31,11 +33,15 @@ struct Miner
     static constexpr unsigned long long numberOfNeurons =
         numberOfInputNeurons + numberOfOutputNeurons;
     static constexpr unsigned long long maxNumberOfNeurons = populationThreshold;
+    static constexpr unsigned long long numberOfEvolutionNeurons =
+        populationThreshold - numberOfNeurons;   // P - K - L
     static constexpr unsigned long long maxNumberOfSynapses =
         populationThreshold * maxNumberOfNeighbors;
     static constexpr unsigned long long trainingSetSize = 1ULL << numberOfInputNeurons; // 2^K
     static constexpr unsigned long long paddingNumberOfSynapses =
         (maxNumberOfSynapses + 31 ) / 32 * 32; // padding to multiple of 32
+    static constexpr unsigned long long mutationChunkSize = 3 * numberOfMutations;
+    static constexpr unsigned long long maxChunkCount = 3;
 
     static_assert(
         maxNumberOfSynapses <= (0xFFFFFFFFFFFFFFFF << 1ULL),
@@ -90,16 +96,16 @@ struct Miner
     ANN bestANN;
     ANN currentANN;
 
-    // Intermediate data
     struct InitValue
     {
         unsigned long long outputNeuronPositions[numberOfOutputNeurons];
+        unsigned long long evolutionNeuronPositions[numberOfEvolutionNeurons];
         unsigned long long synapseWeight[paddingNumberOfSynapses / 32]; // each 64bits elements will
                                                                         // decide value of 32 synapses
-        unsigned long long synpaseMutation[numberOfMutations];
+        unsigned long long mutationChunk[mutationChunkSize];
     } initValue;
 
-    unsigned long long neuronIndices[numberOfNeurons];
+    unsigned long long neuronIndices[maxNumberOfNeurons];
     char previousNeuronValue[maxNumberOfNeurons];
 
     unsigned long long outputNeuronIndices[numberOfOutputNeurons];
@@ -191,7 +197,7 @@ struct Miner
 
 
 
-    void mutate(int mutateStep)
+    bool mutate(unsigned long long synapseMutation)
     {
         // Mutation
         unsigned long long population = currentANN.population;
@@ -199,7 +205,6 @@ struct Miner
         Synapse* synapses = currentANN.synapses;
 
         // Randomly pick a synapse, randomly increase or decrease its weight by 1 or -1
-        unsigned long long synapseMutation = initValue.synpaseMutation[mutateStep];
         unsigned long long totalValidSynapses = population * actualNeighbors;
         unsigned long long flatIdx = (synapseMutation >> 1) % totalValidSynapses;
 
@@ -229,17 +234,12 @@ struct Miner
         {
             synapses[synapseFullBufferIdx].weight = newWeight;
         }
-        else // Invalid weight. Insert a neuron
+        else // Invalid weight.
         {
-            // Insert the neuron
-            insertNeuron(neuronIdx, synapseIndex);
+            return false;
         }
 
-        // Clean the ANN
-        while (scanRedundantNeurons() > 0)
-        {
-            cleanANN();
-        }
+        return true;
     }
 
     // Get the pointer to all outgoing synapse of a neurons
@@ -755,8 +755,8 @@ struct Miner
         Synapse* synapses = currentANN.synapses;
         Neuron* neurons = currentANN.neurons;
 
-        // Initialization
-        population = numberOfNeurons;
+        // Initialization -- fixed-topology: population is N total, set once.
+        population = populationThreshold;
 
         // Generate all 2^K possible (A, B, C) pairs
         generateTrainingSet();
@@ -764,13 +764,15 @@ struct Miner
         // Initalize with nonce and public key
         random2(hash, poolVec.data(), (unsigned char*)&initValue, sizeof(InitValue));
 
-        // Randomly choose the positions of neurons types
+        // Randomly choose the positions of neurons types.
+        // Default = Input.
         for (unsigned long long i = 0; i < population; ++i)
         {
             neuronIndices[i] = i;
             neurons[i].type = Neuron::kInput;
         }
         unsigned long long neuronCount = population;
+        // Output positions from the remaining pool
         for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
         {
             unsigned long long outputNeuronIdx = initValue.outputNeuronPositions[i] % neuronCount;
@@ -783,6 +785,17 @@ struct Miner
             // the number of picking neurons
             neuronCount = neuronCount - 1;
             neuronIndices[outputNeuronIdx] = neuronIndices[neuronCount];
+        }
+
+        // Evolution positions from the remaining pool
+        for (unsigned long long i = 0; i < numberOfEvolutionNeurons; ++i)
+        {
+            unsigned long long evolutionNeuronIdx = initValue.evolutionNeuronPositions[i] % neuronCount;
+
+            neurons[neuronIndices[evolutionNeuronIdx]].type = Neuron::kEvolution;
+
+            neuronCount = neuronCount - 1;
+            neuronIndices[evolutionNeuronIdx] = neuronIndices[neuronCount];
         }
 
         // Synapse weight initialization
@@ -830,16 +843,44 @@ struct Miner
         unsigned int bestR = initializeANN(publicKey, nonce);
         memcpy(&bestANN, &currentANN, sizeof(bestANN));
 
-        for (unsigned long long s = 0; s < numberOfMutations; ++s)
-        {
-            // Do the mutation
-            mutate(s);
+        // Chunk 0 was filled for as part of initializeANN's random2() into
+        // initValue. If exhausted, refill via K12(pubkey || nonce || chunkCounter)
+        unsigned long long chunkIdx = 0;
+        unsigned long long chunkCounter = 1;   // chunk 0 already in initValue
 
-            // Exit if the number of population reaches the maximum allowed
-            if (currentANN.population >= populationThreshold)
+        unsigned long long effectiveMutationIdx = 0;
+        while (effectiveMutationIdx < numberOfMutations)
+        {
+            // The chunk is exhausted, refill if budget allows.
+            if (chunkIdx >= mutationChunkSize)
             {
-                break;
+                if (chunkCounter >= maxChunkCount)
+                {
+                    break;
+                }
+
+                // Derive next chunk. Use publicKey | nonce | chunkCounter as seed
+                unsigned char chunkInput[32 + 32 + sizeof(chunkCounter)];
+                memcpy(chunkInput, publicKey, 32);
+                memcpy(chunkInput + 32, nonce, 32);
+                memcpy(chunkInput + 64, &chunkCounter, sizeof(chunkCounter));
+                unsigned char chunkSeed[32];
+                KangarooTwelve(chunkInput, sizeof(chunkInput), chunkSeed, 32);
+                random2(chunkSeed, poolVec.data(),
+                        (unsigned char*)initValue.mutationChunk,
+                        sizeof(initValue.mutationChunk));
+                chunkCounter++;
+                chunkIdx = 0;
             }
+
+            unsigned long long synapseMutation = initValue.mutationChunk[chunkIdx++];
+
+            // Saturating mutations are silent no-ops; keep drawing.
+            if (!mutate(synapseMutation))
+            {
+                continue;
+            }
+            ++effectiveMutationIdx;
 
             // Ticks simulation
             unsigned int R = inferANN();
@@ -856,8 +897,6 @@ struct Miner
                 // Roll back
                 memcpy(&currentANN, &bestANN, sizeof(bestANN));
             }
-
-            assert(bestANN.population <= populationThreshold);
         }
         return bestR;
     }
