@@ -122,10 +122,10 @@ struct Miner
         static constexpr char weightFromBits[4] = { 0, +1, -1, 0 };
         for (unsigned long long i = 0; i < maxNumberOfSynapses; ++i)
         {
-            // Get byte location: currentANN.synapsesPacked[i >> 2]
-            // Get 2-bits start location in byte: (i & 3) * 2 = (i mod 4) * 2
-            // Keep 2bits: & 0x3U
-            unsigned char ev = (currentANN.synapsesPacked[i >> 2] >> ((i & 3) * 2)) & 0x3U;
+            // Byte location: 4 weights per byte -> currentANN.synapsesPacked[i / 4]
+            // Slot location in byte: (i % 4) * 2
+            // Keep 2 bits: & 0x3U
+            unsigned char ev = (currentANN.synapsesPacked[i / 4] >> ((i % 4) * 2)) & 0x3U;
             synapses[i].weight = weightFromBits[ev];
         }
     }
@@ -229,6 +229,7 @@ struct Miner
     //   0  (11) -> +1 or -1 depending on which bit is flipped (opposite of 00)
     void mutate(unsigned long long synapseMutation)
     {
+        // Seed split: bit 0 -> which of the 2 bits to flip; bits 1..63 -> synapse pick
         unsigned long long population = currentANN.population;
         unsigned long long actualNeighbors = getActualNeighborCount();
 
@@ -243,13 +244,13 @@ struct Miner
 
         // which of the 2 bits will be flipped
         unsigned long long bitOffset = synapseMutation & 1ULL;
-        // byte location
-        unsigned long long byteIdx = synapseFullBufferIdx >> 2;
-        // which 2-bit slot in that byte (0..3) aka (synapseFullBufferIdx mod 4)
-        unsigned long long nibblePos = synapseFullBufferIdx & 0x3ULL;
+        // byte location: 4 weights per byte
+        unsigned long long byteIdx = synapseFullBufferIdx / 4;
+        // which 2-bit slot in that byte (0..3)
+        unsigned long long nibblePos = synapseFullBufferIdx % 4;
         // get mask to the set bit
         unsigned char mask  = 1u << (nibblePos * 2 + bitOffset);
-        // flip the bit, other untouchjed
+        // flip the bit, others untouched
         currentANN.synapsesPacked[byteIdx] ^= mask;
     }
 
