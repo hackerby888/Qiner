@@ -200,7 +200,13 @@ mutate(seed):                               // one LUT flip
 ```
 
 ## Task file
-`[ header 96B ][ topology block ][ data block ]`, both blocks hash-verified against the header. The topology block holds the input/output/signal neuron indices and `neighborIndices[P*K]`; the data block holds `T` rows of input/output trits packed five-per-byte.
+Three parts: `[ header ][ topology block ][ data block ]`.
+
+- **Header** - dimensions (`N, M, T, P, K`) plus a hash of each block; lets the miner confirm it loaded the intended task.
+- **Topology block** - the fixed ANN wiring: which neurons are input / output / signal, and each neuron's neighbours. Defines the network structure and never changes during mining.
+- **Data block** - the sample sequence the ANN is scored against: the input/output rows it must predict across each window.
+
+Both blocks are KangarooTwelve-hashed against the header and rejected on mismatch. Byte-level layout is in `task_file.h`.
 
 # Previous algorithms (history)
 
