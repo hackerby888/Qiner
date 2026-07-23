@@ -55,7 +55,8 @@ void buildSyntheticTaskBlocks(std::vector<unsigned char>& topoBlock,
     fillRandom((unsigned char*)neighborIdx.data(), (size_t)P * K * sizeof(uint32_t));
 
     // Make data valid from random value
-    // Placements must be in range and mutually distinct, neighbours only in range.
+    // Placements must be in range and mutually distinct; neighbours in range and never the owning
+    // neuron (no self-reference).
     std::vector<bool> used(P, false);
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -83,7 +84,12 @@ void buildSyntheticTaskBlocks(std::vector<unsigned char>& topoBlock,
     used[signalIdx] = true;
     for (size_t i = 0; i < (size_t)P * K; ++i)
     {
+        const uint32_t owner = (uint32_t)(i / K);
         neighborIdx[i] %= P;
+        if (neighborIdx[i] == owner)
+        {
+            neighborIdx[i] = (neighborIdx[i] + 1) % P;
+        }
     }
 
     topoBlock.resize((size_t)task_file::topologyBytes(N, M, P, K));

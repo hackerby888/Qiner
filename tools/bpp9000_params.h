@@ -23,15 +23,15 @@ struct Bpp9000Config
 };
 
 // Production config
-using ProdConfig = Bpp9000Config<16, 1, 24 * 365, 24 * 28, 10000, 3, 256, 100,
+using ProdConfig = Bpp9000Config<18, 1, 24 * 365, 24 * 28, 100000, 3, 64, 100,
                              (unsigned int)(((24 * 365 - 24 * 28) - 1) * 4 / 5)>;
 
 // Regression configs that all SUBVIEW-load from the one full production task file
 // but reduce some params for faster test
-using ConfigA = Bpp9000Config<16, 1, 128,      32,      512,   3, 256, 10, (unsigned int)(((128 - 32) - 1) * 4 / 5)>;
-using ConfigB = Bpp9000Config<16, 1, 512,      128,     1024,  3, 256, 15, (unsigned int)(((512 - 128) - 1) * 4 / 5)>;
-using ConfigC = Bpp9000Config<16, 1, 2048,     512,     4096,  3, 256, 20, (unsigned int)(((2048 - 512) - 1) * 4 / 5)>;
-using ConfigD = Bpp9000Config<16, 1, 24 * 365, 24 * 28, 10000, 3, 256, 5,  (unsigned int)(((24 * 365 - 24 * 28) - 1) * 4 / 5)>;
+using ConfigA = Bpp9000Config<18, 1, 128,      32,      5000,   3, 64, 10, (unsigned int)(((128 - 32) - 1) * 4 / 5)>;
+using ConfigB = Bpp9000Config<18, 1, 512,      128,     20000,  3, 64, 15, (unsigned int)(((512 - 128) - 1) * 4 / 5)>;
+using ConfigC = Bpp9000Config<18, 1, 2048,     512,     80000,  3, 64, 20, (unsigned int)(((2048 - 512) - 1) * 4 / 5)>;
+using ConfigD = Bpp9000Config<18, 1, 24 * 365, 24 * 28, 100000, 3, 64, 5,  (unsigned int)(((24 * 365 - 24 * 28) - 1) * 4 / 5)>;
 using ConfigList = std::tuple<ConfigA, ConfigB, ConfigC, ConfigD>;
 
 }
