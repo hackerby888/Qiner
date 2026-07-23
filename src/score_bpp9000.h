@@ -494,15 +494,10 @@ struct Miner
         return best;
     }
 
-    bool findSolution(unsigned char* publicKey, unsigned char* nonce)
+    bool findSolution(unsigned char* publicKey, unsigned char* nonce, unsigned int& outScore)
     {
-        unsigned int totalErrors = computeScore(publicKey, nonce);
-        if (totalErrors <= solutionThreshold)
-        {
-            return true;
-        }
-
-        return false;
+        outScore = computeScore(publicKey, nonce);
+        return outScore <= solutionThreshold;
     }
 };
 

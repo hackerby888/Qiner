@@ -105,7 +105,14 @@ static unsigned char randomSeed[32];
 static const char* taskFilePath = "task_bpp9000.bin";
 static std::atomic<long long> numberOfMiningIterations(0);
 static std::atomic<unsigned int> numberOfFoundSolutions(0);
-static std::queue<std::array<unsigned char, 32>> foundNonce;
+// A found solution: the nonce plus the score the miner computed for it. The score is sent in the
+// broadcast so the node can reject a submission whose claimed score does not match its own computation.
+struct FoundSolution
+{
+    std::array<unsigned char, 32> nonce;
+    unsigned int score;
+};
+static std::queue<FoundSolution> foundNonce;
 std::mutex foundNonceLock;
 
 #ifdef _MSC_VER
@@ -198,7 +205,8 @@ int miningThreadProc()
         // id. It must be the exact value.
         nonce[0] = (unsigned char)AlgoType::Bpp9000;
 
-        bool solutionFound = bpp9000Miner->findSolution(computorPublicKey, nonce.data());
+        unsigned int solutionScore = 0;
+        bool solutionFound = bpp9000Miner->findSolution(computorPublicKey, nonce.data(), solutionScore);
         // Stats
         qinerStat.totalBpp9000Nonce.fetch_add(1);
         if (solutionFound)
@@ -210,7 +218,7 @@ int miningThreadProc()
         {
             {
                 std::lock_guard<std::mutex> guard(foundNonceLock);
-                foundNonce.push(nonce);
+                foundNonce.push({ nonce, solutionScore });
             }
             numberOfFoundSolutions++;
         }
@@ -400,12 +408,14 @@ int main(int argc, char* argv[])
                 bool haveNonceToSend = false;
                 size_t itemToSend = 0;
                 std::array<unsigned char, 32> sendNonce;
+                unsigned int sendScore = 0;
                 {
                     std::lock_guard<std::mutex> guard(foundNonceLock);
                     haveNonceToSend = foundNonce.size() > 0;
                     if (haveNonceToSend)
                     {
-                        sendNonce = foundNonce.front();
+                        sendNonce = foundNonce.front().nonce;
+                        sendScore = foundNonce.front().score;
                     }
                     itemToSend = foundNonce.size();
                 }
@@ -419,6 +429,7 @@ int main(int argc, char* argv[])
                             Message message;
                             unsigned char solutionMiningSeed[32];
                             unsigned char solutionNonce[32];
+                            unsigned int solutionScore;
                             unsigned char signature[64];
                         } packet;
 
@@ -450,13 +461,17 @@ int main(int argc, char* argv[])
                             KangarooTwelve(sharedKeyAndGammingNonce, 64, gammingKey, 32);
                         } while (gammingKey[0]);
 
-                        // Encrypt the message payload
-                        unsigned char gamma[32 + 32];
+                        // Encrypt the message payload: mining seed (32) + nonce (32) + score (4).
+                        unsigned char gamma[32 + 32 + 4];
                         KangarooTwelve(gammingKey, sizeof(gammingKey), gamma, sizeof(gamma));
                         for (unsigned int i = 0; i < 32; i++)
                         {
                             packet.solutionMiningSeed[i] = randomSeed[i] ^ gamma[i];
                             packet.solutionNonce[i] = sendNonce[i] ^ gamma[i + 32];
+                        }
+                        for (unsigned int i = 0; i < 4; i++)
+                        {
+                            ((unsigned char*)&packet.solutionScore)[i] = ((const unsigned char*)&sendScore)[i] ^ gamma[64 + i];
                         }
 
                         // Sign the message
