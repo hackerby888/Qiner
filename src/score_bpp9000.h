@@ -447,12 +447,9 @@ struct Miner
         {
             L = MAX_LUT_ENTRIES_PER_STEP;
         }
-        
-        unsigned long long K = nonce[2];
-        if (K > numberOfMutations)
-        {
-            K = numberOfMutations;
-        }
+
+        // Pre-ant-colony phase, the anti-attractor (explore) is disabled. nonce[2] is temporarily unused here.
+        const unsigned long long K = 0;
 
         unsigned int cur = initializeANN(publicKey, nonce);
         memcpy(&bestANN, &currentANN, sizeof(bestANN));
