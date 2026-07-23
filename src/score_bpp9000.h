@@ -447,6 +447,7 @@ struct Miner
         {
             L = MAX_LUT_ENTRIES_PER_STEP;
         }
+        
         unsigned long long K = nonce[2];
         if (K > numberOfMutations)
         {

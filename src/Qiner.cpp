@@ -194,8 +194,9 @@ int miningThreadProc()
         _rdrand64_step((unsigned long long*)&nonce.data()[16]);
         _rdrand64_step((unsigned long long*)&nonce.data()[24]);
 
-        // bpp9000 is the odd-nonce slot; force bit 0 so every attempt is a valid bpp9000 nonce.
-        nonce[0] |= 1;
+        // nonce[0] is the algorithm id (see core score_common.h AlgoType): set it exactly to the bpp9000
+        // id. It must be the exact value.
+        nonce[0] = (unsigned char)AlgoType::Bpp9000;
 
         bool solutionFound = bpp9000Miner->findSolution(computorPublicKey, nonce.data());
         // Stats

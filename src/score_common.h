@@ -5,6 +5,13 @@
 
 #include <vector>
 
+enum AlgoType
+{
+    Neuraxon = 0,   // reserved for a future algorithm (not yet implemented)
+    Bpp9000 = 1,    // the active mining algorithm
+    MaxAlgoCount    // number of supported algos; also the "no valid algorithm" sentinel from getAlgoType
+};
+
 constexpr unsigned long long POOL_VEC_SIZE =  (((1ULL<<32) + 64)) >> 3; // 2^32+64 bits ~ 512MB
 constexpr unsigned long long POOL_VEC_PADDING_SIZE = (POOL_VEC_SIZE + 200 - 1) / 200 * 200; // padding for multiple of 200
 
