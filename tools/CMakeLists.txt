@@ -23,3 +23,14 @@ target_include_directories(bpp9000_test_generator
 target_link_libraries(bpp9000_test_generator
     PRIVATE
     ${TOOLS_LINK_LIBS})
+
+# Convert cached BTC candles into the bpp9000 task file
+add_executable(bpp9000_task_from_candles bpp9000_task_from_candles.cpp)
+
+target_include_directories(bpp9000_task_from_candles
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+target_link_libraries(bpp9000_task_from_candles
+    PRIVATE
+    ${TOOLS_LINK_LIBS})
