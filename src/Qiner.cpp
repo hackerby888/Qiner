@@ -204,6 +204,10 @@ int miningThreadProc()
         // nonce[0] is the algorithm id (see core score_common.h AlgoType): set it exactly to the bpp9000
         // id. It must be the exact value.
         nonce[0] = (unsigned char)AlgoType::Bpp9000;
+         // L: enforce [1, 10] to be a canonical nonce
+        nonce[1] = (nonce[1] % score_bpp9000::MAX_LUT_ENTRIES_PER_STEP) + 1;
+        // K: enforce 0 to be a canonical nonce
+        nonce[2] = 0;
 
         unsigned int solutionScore = 0;
         bool solutionFound = bpp9000Miner->findSolution(computorPublicKey, nonce.data(), solutionScore);
