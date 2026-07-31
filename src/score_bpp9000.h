@@ -22,6 +22,7 @@ static constexpr unsigned long long MAX_NUMBER_OF_TICKS = 100000;
 static constexpr unsigned int MAX_LUT_ENTRIES_PER_STEP = 10;
 static constexpr unsigned long long SEQUENCE_LENGTH = 24 * 365;
 static constexpr unsigned long long WINDOW_WIDTH = 24 * 28;
+static constexpr unsigned long long NUMBER_OF_WINDOWS = SEQUENCE_LENGTH - WINDOW_WIDTH;
 
 // Placeholder,
 // TODO: adjust this later

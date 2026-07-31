@@ -25,10 +25,8 @@
 
 #include "keyUtils.h"
 #include "K12AndKeyUtil.h"
-#include "score_common.h"   // AlgoType
+#include "score_bpp9000.h"
 
-// bpp9000 score range: [0, numberOfWindows]. Must match the core node.
-static constexpr unsigned int NUMBER_OF_WINDOWS = 24 * 365 - 24 * 28;   // 8088
 
 char* nodeIp = NULL;
 int nodePort = 0;
@@ -338,7 +336,7 @@ int main(int argc, char* argv[])
             // Send the given nonce verbatim - identical every iteration, so the node dedups all but the
             // first. The score must match what the node decodes from nonce[30..31].
             memcpy(nonce, fixedNonce, 32);
-            target = ((unsigned int)nonce[30] | ((unsigned int)nonce[31] << 8)) % (NUMBER_OF_WINDOWS + 1);
+            target = ((unsigned int)nonce[30] | ((unsigned int)nonce[31] << 8)) % (score_bpp9000::NUMBER_OF_WINDOWS + 1);
         }
         else
         {
@@ -347,17 +345,23 @@ int main(int argc, char* argv[])
             _rdrand64_step((unsigned long long*)&nonce[8]);
             _rdrand64_step((unsigned long long*)&nonce[16]);
             _rdrand64_step((unsigned long long*)&nonce[24]);
+            // Canonical nonce (see core isCanonicalBpp9000Nonce): nonce[0]=algo, nonce[1]=L in [1,10],
+            // nonce[2]=K=0; else core scores it INVALID once the canonical activation tick hits.
             nonce[0] = (unsigned char)AlgoType::Bpp9000;
+            // L: canonical [1, 10]
+            nonce[1] = (nonce[1] % score_bpp9000::MAX_LUT_ENTRIES_PER_STEP) + 1;
+            // K: canonical 0
+            nonce[2] = 0;
 
             if (score >= 0)
             {
-                target = (unsigned int)score % (NUMBER_OF_WINDOWS + 1);
+                target = (unsigned int)score % (score_bpp9000::NUMBER_OF_WINDOWS + 1);
             }
             else
             {
                 unsigned int r = 0;
                 _rdrand32_step(&r);
-                target = r % (NUMBER_OF_WINDOWS + 1);
+                target = r % (score_bpp9000::NUMBER_OF_WINDOWS + 1);
             }
             nonce[30] = (unsigned char)(target & 0xFF);
             nonce[31] = (unsigned char)((target >> 8) & 0xFF);
