@@ -21,8 +21,7 @@
 
 #endif
 
-#include "score_hyperidentity.h"
-#include "score_addition.h"
+#include "score_bpp9000.h"
 #include "keyUtils.h"
 
 struct RequestResponseHeader
@@ -102,9 +101,18 @@ static std::atomic<char> state(0);
 
 static unsigned char computorPublicKey[32];
 static unsigned char randomSeed[32];
+// Path to the bpp9000 task file (input/output trit data); overridable via CLI.
+static const char* taskFilePath = "task_bpp9000.bin";
 static std::atomic<long long> numberOfMiningIterations(0);
 static std::atomic<unsigned int> numberOfFoundSolutions(0);
-static std::queue<std::array<unsigned char, 32>> foundNonce;
+// A found solution: the nonce plus the score the miner computed for it. The score is sent in the
+// broadcast so the node can reject a submission whose claimed score does not match its own computation.
+struct FoundSolution
+{
+    std::array<unsigned char, 32> nonce;
+    unsigned int score;
+};
+static std::queue<FoundSolution> foundNonce;
 std::mutex foundNonceLock;
 
 #ifdef _MSC_VER
@@ -153,45 +161,37 @@ int getSystemProcs()
 
 struct Stat
 {
-    std::atomic<unsigned long long> totalAdditionNonce;
-    std::atomic<unsigned long long> totalHyperIdentityNonce;
-    std::atomic<unsigned long long> totalHyperIdentitySols;
-    std::atomic<unsigned long long> totalAdditionSols;
+    std::atomic<unsigned long long> totalBpp9000Nonce;
+    std::atomic<unsigned long long> totalBpp9000Sols;
 
     Stat()
     {
-        totalAdditionNonce.store(0);
-        totalHyperIdentityNonce.store(0);
-        totalHyperIdentitySols.store(0);
-        totalAdditionSols.store(0);
+        totalBpp9000Nonce.store(0);
+        totalBpp9000Sols.store(0);
     }
 
 } qinerStat;
 
-using AdditionMiner = score_addition::Miner<
-    score_addition::NUMBER_OF_INPUT_NEURONS,
-    score_addition::NUMBER_OF_OUTPUT_NEURONS,
-    score_addition::NUMBER_OF_TICKS,
-    score_addition::MAX_NEIGHBOR_NEURONS,
-    score_addition::POPULATION_THRESHOLD,
-    score_addition::NUMBER_OF_MUTATIONS,
-    score_addition::SOLUTION_THRESHOLD>;
-using HyperIdentityMiner = score_hyberidentity::Miner<
-    score_hyberidentity::NUMBER_OF_INPUT_NEURONS,
-    score_hyberidentity::NUMBER_OF_OUTPUT_NEURONS,
-    score_hyberidentity::NUMBER_OF_TICKS,
-    score_hyberidentity::MAX_NEIGHBOR_NEURONS,
-    score_hyberidentity::POPULATION_THRESHOLD,
-    score_hyberidentity::NUMBER_OF_MUTATIONS,
-    score_hyberidentity::SOLUTION_THRESHOLD>;
+using Bpp9000Miner = score_bpp9000::Miner<
+    score_bpp9000::NUMBER_OF_INPUT_NEURONS,
+    score_bpp9000::NUMBER_OF_OUTPUT_NEURONS,
+    score_bpp9000::SEQUENCE_LENGTH,
+    score_bpp9000::WINDOW_WIDTH,
+    score_bpp9000::MAX_NUMBER_OF_TICKS,
+    score_bpp9000::NUMBER_OF_NEIGHBORS,
+    score_bpp9000::POPULATION_THRESHOLD,
+    score_bpp9000::NUMBER_OF_MUTATIONS,
+    score_bpp9000::SOLUTION_THRESHOLD>;
 
 int miningThreadProc()
 {
-    std::unique_ptr<AdditionMiner> additionMiner(new AdditionMiner());
-    additionMiner->initialize(randomSeed);
-
-    std::unique_ptr<HyperIdentityMiner> hyperIdentityMiner(new HyperIdentityMiner());
-    hyperIdentityMiner->initialize(randomSeed);
+    std::unique_ptr<Bpp9000Miner> bpp9000Miner(new Bpp9000Miner());
+    // bpp9000 loads the topology (placement/wiring) and the data from the unified task file.
+    if (!bpp9000Miner->initialize(randomSeed, taskFilePath))
+    {
+        printf("Failed to load task file '%s' for the bpp9000 miner.\n", taskFilePath);
+        return -1;
+    }
 
     std::array<unsigned char, 32> nonce;
     while (!state)
@@ -201,35 +201,28 @@ int miningThreadProc()
         _rdrand64_step((unsigned long long*)&nonce.data()[16]);
         _rdrand64_step((unsigned long long*)&nonce.data()[24]);
 
-        bool solutionFound = false;
+        // nonce[0] is the algorithm id (see core score_common.h AlgoType): set it exactly to the bpp9000
+        // id. It must be the exact value.
+        nonce[0] = (unsigned char)AlgoType::Bpp9000;
+         // L: enforce [1, 10] to be a canonical nonce
+        nonce[1] = (nonce[1] % score_bpp9000::MAX_LUT_ENTRIES_PER_STEP) + 1;
+        // K: enforce 0 to be a canonical nonce
+        nonce[2] = 0;
 
-        // First byte of nonce is used for determine type of score
-        if ((nonce[0] & 1) == 0)
+        unsigned int solutionScore = 0;
+        bool solutionFound = bpp9000Miner->findSolution(computorPublicKey, nonce.data(), solutionScore);
+        // Stats
+        qinerStat.totalBpp9000Nonce.fetch_add(1);
+        if (solutionFound)
         {
-            solutionFound = hyperIdentityMiner->findSolution(computorPublicKey, nonce.data());
-            // Stats
-            qinerStat.totalHyperIdentityNonce.fetch_add(1);
-            if (solutionFound)
-            {
-                qinerStat.totalHyperIdentitySols.fetch_add(1);
-            }
-        }
-        else
-        {
-            solutionFound = additionMiner->findSolution(computorPublicKey, nonce.data());
-            // Stats
-            qinerStat.totalAdditionNonce.fetch_add(1);
-            if (solutionFound)
-            {
-                qinerStat.totalAdditionSols.fetch_add(1);
-            }
+            qinerStat.totalBpp9000Sols.fetch_add(1);
         }
 
         if (solutionFound)
         {
             {
                 std::lock_guard<std::mutex> guard(foundNonceLock);
-                foundNonce.push(nonce);
+                foundNonce.push({ nonce, solutionScore });
             }
             numberOfFoundSolutions++;
         }
@@ -365,9 +358,9 @@ static void hexToByte(const char* hex, uint8_t* byte, const int sizeInByte)
 int main(int argc, char* argv[])
 {
     std::vector<std::thread> miningThreads;
-    if (argc != 7)
+    if (argc != 7 && argc != 8)
     {
-        printf("Usage:   Qiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Mining Seed] [Number of threads]\n");
+        printf("Usage:   Qiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Mining Seed] [Number of threads] [Task file path (optional)]\n");
     }
     else
     {
@@ -396,6 +389,13 @@ int main(int argc, char* argv[])
             //getIdentityFromPublicKey(signingPublicKey, miningID, false);
 
             hexToByte(argv[5], randomSeed, 32);
+
+            // Task file path is optional (argv[7]); defaults to task_bpp9000.bin.
+            if (argc >= 8)
+            {
+                taskFilePath = argv[7];
+            }
+
             unsigned int numberOfThreads = atoi(argv[6]);
             printf("%d threads are used.\n", numberOfThreads);
             miningThreads.reserve(numberOfThreads);
@@ -412,12 +412,14 @@ int main(int argc, char* argv[])
                 bool haveNonceToSend = false;
                 size_t itemToSend = 0;
                 std::array<unsigned char, 32> sendNonce;
+                unsigned int sendScore = 0;
                 {
                     std::lock_guard<std::mutex> guard(foundNonceLock);
                     haveNonceToSend = foundNonce.size() > 0;
                     if (haveNonceToSend)
                     {
-                        sendNonce = foundNonce.front();
+                        sendNonce = foundNonce.front().nonce;
+                        sendScore = foundNonce.front().score;
                     }
                     itemToSend = foundNonce.size();
                 }
@@ -431,6 +433,7 @@ int main(int argc, char* argv[])
                             Message message;
                             unsigned char solutionMiningSeed[32];
                             unsigned char solutionNonce[32];
+                            unsigned int solutionScore;
                             unsigned char signature[64];
                         } packet;
 
@@ -462,13 +465,17 @@ int main(int argc, char* argv[])
                             KangarooTwelve(sharedKeyAndGammingNonce, 64, gammingKey, 32);
                         } while (gammingKey[0]);
 
-                        // Encrypt the message payload
-                        unsigned char gamma[32 + 32];
+                        // Encrypt the message payload: mining seed (32) + nonce (32) + score (4).
+                        unsigned char gamma[32 + 32 + 4];
                         KangarooTwelve(gammingKey, sizeof(gammingKey), gamma, sizeof(gamma));
                         for (unsigned int i = 0; i < 32; i++)
                         {
                             packet.solutionMiningSeed[i] = randomSeed[i] ^ gamma[i];
                             packet.solutionNonce[i] = sendNonce[i] ^ gamma[i + 32];
+                        }
+                        for (unsigned int i = 0; i < 4; i++)
+                        {
+                            ((unsigned char*)&packet.solutionScore)[i] = ((const unsigned char*)&sendScore)[i] ^ gamma[64 + i];
                         }
 
                         // Sign the message
@@ -522,8 +529,7 @@ int main(int argc, char* argv[])
         }
 
         // Print stats
-        printf("Hyperidentity sols / nonces: %llu / %llu \n", qinerStat.totalHyperIdentitySols.load(), qinerStat.totalHyperIdentityNonce.load());
-        printf("Addition sols / nonces: %llu / %llu \n", qinerStat.totalAdditionSols.load(), qinerStat.totalAdditionNonce.load());
+        printf("BPP9000 sols / nonces: %llu / %llu \n", qinerStat.totalBpp9000Sols.load(), qinerStat.totalBpp9000Nonce.load());
 
         printf("Qiner is shut down.\n");
     }

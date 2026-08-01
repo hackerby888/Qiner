@@ -10,11 +10,11 @@ This project is licensed under the **Anti-Military License**—see the `LICENSE`
 This project incorporates code from third-party sources which are governed by different licenses. Full compliance information, including the original copyright notices and terms for these dependencies, can be found in the **`NOTICE`** file in the repository root.
 
 ## File structure
-- score_hyperidentity.h: Implements the mining and scoring logic using hyperidentity algorithm.
-- score_addition.h: Implements the mining and scoring logic using addition algorithm.
-- score_common.h: shared functions using for scoring
-- Qiner.cpp: Contains the main process logic/functionality. Mainly show how to communicate with the node.
+- score_common.h: shared functions used for scoring (the random2 pool generator).
+- Qiner.cpp: Contains the main process logic/functionality. Mainly shows how to communicate with the node and drive the miner.
 - K12AndKeyUtill.h, keyUtils.h, keyUtils.cpp: Provide K12 and key conversion utilities/functions.
+
+The algorithm-specific files (the scorer and its task format) are listed in the algorithm section.
 
 # Requirement
 - CPU: support at least AVX2 instruction set
@@ -91,12 +91,126 @@ CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=1
 ```
 ./Qiner <Node IP> <Node Port> <MiningID> <Signing Seed> <Mining Seed> <Number of threads>
 ```
+The active algorithm may take an extra trailing argument - see its section below.
 
 Example: 
 ```
 ./Qiner 192.168.1.2 31841 BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaa
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 8
 ```
+
+# Algorithm 2026-07-16 (bpp9000)
+
+## Files
+- score_bpp9000.h: the bpp9000 scorer (a recurrent ternary-LUT network).
+- task_file.h: the unified task-file format (topology + data blocks) with pack/parse and hash helpers.
+
+## Run argument
+The miner takes one optional trailing CLI argument - `[Task file path]` - the path to the bpp9000 task file; it defaults to `task_bpp9000.bin`.
+
+## Overview
+A recurrent ternary-LUT network scored over a windowed sequence. Given a task (a fixed network wiring plus a sequence of input/output samples), mining searches the per-neuron lookup tables (LUTs) for the configuration that reproduces the samples with the fewest errors. The score is that error count (lower is better). The task is loaded from a unified task file (defaults to `task_bpp9000.bin`).
+
+## Key concepts
+- Every value is a **trit** in `{0, 1, 2}`, where `2 = UNKNOWN`.
+- The network has `P` neurons, each typed **input** / **output** / **evolution**; each neuron owns a `27`-entry **LUT** (`3^3`).
+- A neuron's next value is `LUT[t0 + 3*t1 + 9*t2]`, indexed by its three neighbours' trits.
+- Wiring is explicit per neuron (`neighborIndices[n*K + k]`, any neuron in `[0, P)`). One **signal neuron** self-clocks the input feeding.
+- Only the LUTs change under mutation; the wiring and the sample data are fixed by the task.
+
+## Random sources
+Where every part of the network comes from. `random2` never invents bytes - it reads them out of the pool, and the "derived from" value only selects the read positions.
+
+| Source | Derived from | When |
+|---|---|---|
+| `random2` pool | epoch spectrum digest | epoch start |
+| Neuron placement (input / output / signal) | read from the task file | epoch start |
+| Wiring (each neuron's 3 neighbours) | read from the task file | epoch start |
+| Initial LUT contents | `K12(publicKey)` | per public key |
+| Mutation seeds | `K12(publicKey \|\| nonce[3..31])` | per nonce |
+| Algorithm select | `(nonce[0] & 1) != 0` -> bpp9000 (odd nonce; the miner mines odd nonces) | per nonce |
+| L (LUT entries changed per mutation) | `nonce[1]` | per nonce |
+| K (anti-attractor length) | `nonce[2]` | per nonce |
+
+The random pool is built from the epoch spectrum digest, in Qiner it is seen as miningSeed, the public key decide the starting LUT ,the public key and nonce decide *where each draw reads from it*. Neuron placement and wiring are no longer random: they are read from the task file.
+
+## Constants
+```
+K = NUMBER_OF_NEIGHBORS        // 3, hardcoded (LUT index is base-3 over 3 trits)
+N = NUMBER_OF_INPUT_NEURONS
+P = POPULATION_THRESHOLD       // total neurons, power of 2
+T = SEQUENCE_LENGTH            // samples in the task
+W = WINDOW_WIDTH               // samples fed per window
+numberOfWindows = T - W        // graded windows per score()
+maxTicks = MAX_NUMBER_OF_TICKS // per-window inference budget; exceeding it fails the process
+S = NUMBER_OF_MUTATIONS        // search steps
+```
+
+## Code flow (pseudocode)
+```
+initialize(miningSeed, taskFile):
+    generateRandom2Pool(miningSeed) -> pool
+    loadTaskData(taskFile):
+        parse + hash-verify the topology block (input / output / signal indices + neighbour wiring)
+        parse + hash-verify the data block (packed input / output trit samples)
+        derive neuron roles (input / output / evolution)
+
+// The miner tries random odd nonces until one solves:
+findSolution(publicKey, nonce):
+    return computeScore(publicKey, nonce) <= SOLUTION_THRESHOLD
+
+computeScore(publicKey, nonce):             // anti-attractor local search
+    L     = clamp(nonce[1], 1, MAX_L)       // LUT flips applied per step
+    Kexpl = clamp(nonce[2], 0, S)           // length of the explore phase
+    cur   = initializeANN(publicKey, nonce)
+    best  = cur
+    for s in 0 .. S-1:
+        save previous LUTs
+        for i in 0 .. L-1:                       // apply L LUT flips this step
+            mutate(mutationSeed[s * MAX_L + i])  // each flips one LUT entry
+        r = score()
+        accept = (s < Kexpl) ? (r >= cur)   // explore: allow equal-or-worse
+                             : (r <= cur)   // exploit: keep equal-or-better
+        if accept: cur = r  else: rollback to previous LUTs
+        if cur < best: best = cur
+    return best
+
+initializeANN(publicKey, nonce):
+    initial LUT    = random2(K12(publicKey), pool)                 // per computor, fixed
+    mutation seeds = random2(K12(publicKey || nonce[3..31]), pool) // the search path (nonce[0..2] excluded)
+    set neuron types + values (UNKNOWN); set current LUTs from the initial LUT
+    return score()
+
+score():                                    // windowed, self-clocked; lower is better
+    failures = 0
+    for window in 0 .. numberOfWindows-1:
+        reset all neurons to UNKNOWN
+        feed W input samples, paced by the signal neuron, then read the settled output
+        if it does not settle within maxTicks: return INFINITE_ERROR   // fails the whole network
+        if predicted output != expected output: failures++
+    return failures
+
+processTick():                              // one inference step
+    for each non-input neuron:
+        next value = LUT[t0 + 3*t1 + 9*t2] from its three neighbours
+    commit the new value into every non-input neuron
+
+mutate(seed):                               // one LUT flip
+    pick one LUT entry of one non-input neuron; set it to a different trit
+```
+
+## Task file
+Three parts: `[ header ][ topology block ][ data block ]`.
+
+- **Header** - dimensions (`N, M, T, P, K`) plus a hash of each block; lets the miner confirm it loaded the intended task.
+- **Topology block** - the fixed ANN wiring: which neurons are input / output / signal, and each neuron's neighbours. Defines the network structure and never changes during mining.
+- **Data block** - the sample sequence the ANN is scored against: the input/output rows it must predict across each window.
+
+Both blocks are KangarooTwelve-hashed against the header and rejected on mismatch. Byte-level layout is in `task_file.h`.
+
+# Previous algorithms (history)
+
+The algorithms below are retired - their code has been removed from the miner. They are kept here for historical reference.
 
 # Algorithm 2025-05-15 (hyperidentity)
 

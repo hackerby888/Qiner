@@ -25,9 +25,7 @@
   <ItemGroup>
     <ClInclude Include="src\K12AndKeyUtil.h" />
     <ClInclude Include="src\keyUtils.h" />
-    <ClInclude Include="src\score_addition.h" />
     <ClInclude Include="src\score_common.h" />
-    <ClInclude Include="src\score_hyperidentity.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
