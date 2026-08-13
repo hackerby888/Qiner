@@ -11,7 +11,8 @@ This project incorporates code from third-party sources which are governed by di
 
 ## File structure
 - score_common.h: shared functions used for scoring (the random2 pool generator).
-- Qiner.cpp: Contains the main process logic/functionality. Mainly shows how to communicate with the node and drive the miner.
+- Qiner.cpp: Contains the main process logic/functionality. Mainly shows how to communicate with the node and drive the Standalone miner.
+- AntMiner.cpp: the ant-colony reference miner - tree search over the bpp9000 scorer (see the "ant colony on bpp9000" algorithm section).
 - K12AndKeyUtill.h, keyUtils.h, keyUtils.cpp: Provide K12 and key conversion utilities/functions.
 
 The algorithm-specific files (the scorer and its task format) are listed in the algorithm section.
@@ -98,6 +99,77 @@ Example:
 ./Qiner 192.168.1.2 31841 BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaa
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 8
 ```
+
+# Algorithm 2026-08-14 (ant colony on bpp9000)
+
+Standalone bpp9000 mining (`Qiner`) searches from your identity's root network for any network that scores at or below the epoch threshold; every solution stands alone. **Ant-colony mining is tree search over the same scorer.** You take a *parent* network already in the tree - your identity's root, or a node you placed earlier - inherit its LUTs, mutate them under your nonce, and score the result. A hit must clear the epoch threshold **and** strictly beat its parent's score. On acceptance it becomes a new tree node that can be extended further, so the colony converges toward the single lowest-error network of the epoch. Lower score is better - the score is an error count.
+
+Trees are **per-identity**: a forest, one tree per mining identity, and you only ever extend your own nodes. `AntMiner.cpp` is the reference implementation; the Standalone `Qiner` is unchanged and still available.
+
+## Where the tree lives
+
+The authoritative tree lives on the **node** - it is the consensus store (a per-identity forest), and every accepted solution becomes a node in it. The node also recomputes every claimed score deterministically and gates acceptance, so the miner's real job is to reproduce the node's score bit-exactly and submit on time. Everything the miner keeps locally is advisory; consensus lives on the node.
+
+But the miner does **not** have to treat that tree as remote storage it queries on every step. Extending a parent needs the parent's LUT (its evolved ANN), and scoring is fully deterministic in `(parentLUT, pubkey, nonce, anchorDigest)` - so a miner can **build the tree locally and avoid fetching ANNs**:
+
+- **Your own nodes** - the miner already holds the winning `bestANN` of every solution it computed, so extending your own frontier needs no fetch. The reference `AntMiner` keeps exactly that (`ownNodes[].ann`) and, since trees are per-identity, only ever extends its own nodes - so its mining loop fetches no ANN at all.
+- **A node you did not compute** (a pool splitting one identity across workers, or after a restart) - either ask the node for the parent's ANN, or rebuild it locally by replaying the lineage from the root under the on-chain `(nonce, anchor)` values. Both land on the same LUT; the local rebuild trades CPU for network round-trips.
+
+The node still owns what only it can: the epoch context (root seed, threshold, freshness window, child cap), the anchors, acceptance gating, and the deposit refund/forfeit. Full wire and consensus contract: core `doc/ant_colony/ant_colony_miner_guide.md`.
+
+## Build and run
+
+`AntMiner` builds alongside `Qiner` from the same CMake / `Qiner.sln` (target `AntMiner`).
+
+```
+./AntMiner <Node IP> <Node Port> <MiningID> <Signing Seed> [Threads] --task <task file>
+```
+There is **no Mining Seed argument** (unlike the Standalone `Qiner`): the pool seed is the epoch spectrum digest, which `AntMiner` reads from the node's epoch context - so it cannot mine a wrong or stale pool by hand. `--task` is required and must be the epoch's pinned task file; `AntMiner` checks its topology/data hashes against the node's canonical hashes and refuses to mine on a mismatch (a wrong task wastes work and forfeits deposits).
+
+Example:
+```
+./AntMiner 192.168.1.2 31841 BZBQ...WLZBQEXK aaaa...aaa 8 --task task_bpp9000.bin
+```
+
+## The mining loop
+
+What `AntMiner` does each round:
+
+1. **Epoch context** (`REQUEST_ANT_EPOCH_CONTEXT`) - spectrum digest (seeds the `random2` pool), canonical task hashes, threshold, freshness window, per-parent child cap.
+2. **Task check** - load `--task`, require its topology/data hashes to equal the node's; abort otherwise.
+3. **Root** - `deriveRootANN(publicKey)` from the pool: your identity's per-epoch root network. Never stored on-chain; you compute it. The spectrum digest SEEDS the pool - the root is `deriveRootANN(publicKey, pool)`, **not** `K12(publicKey \|\| digest)`.
+4. **Parent selection** - the best resolved own node (lowest score = deepest frontier), else the root. 1-in-8 rounds explore a random resolved node or the root instead, so the search does not lock into one basin. (Pools tune this policy.)
+5. **Anchor first** - pick the latest completed tick (stepping back past ticks the node stored no data for). Its digest `K12(anchorTick \|\| K12(TickData))` is part of the child RNG seed, so the anchor is fixed *before* mining and keeps the hit inside the freshness window.
+6. **Search** - random canonical nonce, `computeScoreFromParent(parentLUT, pubkey, nonce, anchorDigest)`; keep a hit when `score <= threshold` and `score < parentScore`.
+7. **Submit** - only if the anchor is still inside the freshness window (else drop as stale) and the parent is under its child cap. Sent as a `BROADCAST_MESSAGE` whose decrypted `gammingKey[0] == 3` (`MESSAGE_TYPE_ANT_SOLUTION`); payload = parent ref + anchor tick + claimed score + nonce.
+8. **Resolve** - every ~10 s, read your own tree back (operator-signed `REQUEST_ANT_IDENTITY_TREE`), learn each submitted node's self-ref (a child can only extend a parent whose ref is known), and read tree growth. A node still not on-chain after 3 resolve cycles warns of a likely **anchor-digest mismatch** - compare the printed `Anchor tick N digest=` with the node's F3 line.
+
+## Canonical ant nonce
+
+`computeScoreFromParent` rejects a non-canonical nonce with `INVALID_SCORE_VALUE` (`0xFFFFFFFF`), and so does the node - a rejected score forfeits the deposit, so the miner canonicalizes every nonce before scoring.
+
+| Byte | Meaning | Range |
+|---|---|---|
+| `nonce[0]` | algorithm select | `1` (bpp9000) |
+| `nonce[1]` | `L` - LUT entries changed per mutation step | `[1, 10]` (`MAX_LUT_ENTRIES_PER_STEP`) |
+| `nonce[2]` | `K` - explore-phase length (anti-attractor) | `[0, 100]` (`NUMBER_OF_MUTATIONS`) |
+| `nonce[3..31]` | search-path seed | any |
+
+Contrast with the Standalone `Qiner`, which *clamps* `L` and forces `K = 0`; the ant path requires the values already in range.
+
+## Scorer API - two entry points, one walk
+
+Both entry points feed the same anti-attractor local search (`computeScoreFromCurrent(L, K, cur)`); they differ only in where the starting LUTs and the mutation seeds come from.
+
+| Aspect | Standalone (`Qiner`) | Ant (`AntMiner`) |
+|---|---|---|
+| Entry | `computeScore(pubkey, nonce)` | `deriveRootANN` + `computeScoreFromParent(parentLUT, pubkey, nonce, anchorDigest)` |
+| Starting LUTs | `random2(K12(pubkey))` - your root | the parent's LUT (root or a fetched node) |
+| Mutation seeds | `K12(pubkey \|\| nonce[3..31])` | `K12(pubkey \|\| nonce[3..31] \|\| anchorDigest)` - anchor-bound |
+| `K` (explore) | forced 0 | `nonce[2]` |
+| Pool | owned (`initialize` fills it) | shared read-only (`setPool`), one pool across all threads |
+
+`bestANN` (via `getBestANN`) is the evolved network of the winning search; it becomes the child node's LUT that the next depth extends.
 
 # Algorithm 2026-07-16 (bpp9000)
 
