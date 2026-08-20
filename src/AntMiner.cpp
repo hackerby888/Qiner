@@ -29,6 +29,8 @@
 #define END_RESPONSE 35
 #define REQUEST_ANT_IDENTITY_TREE 72
 #define RESPOND_ANT_IDENTITY_TREE 73
+#define REQUEST_ANT_PARENT_ANN 74
+#define RESPOND_ANT_PARENT_ANN 75
 #define REQUEST_ANT_EPOCH_CONTEXT 76
 #define RESPOND_ANT_EPOCH_CONTEXT 77
 
@@ -100,6 +102,27 @@ static_assert(sizeof(AntIdentityTreeNode) == 32, "AntIdentityTreeNode unexpected
 // ROOT sentinel of a parent reference (matches core SolutionRef ROOT_REF).
 static constexpr unsigned int ROOT_TICK = 0U;
 static constexpr unsigned int ROOT_INDEX_IN_TICK = 0xFFFFFFFFU;
+
+struct RequestAntParentAnn
+{
+    unsigned int parentRefTick;
+    unsigned int parentRefSolutionIndexInTick;
+};
+static_assert(sizeof(RequestAntParentAnn) == 8, "RequestAntParentAnn unexpected size");
+
+static constexpr unsigned char ANT_PARENT_ANN_STATUS_OK = 0;
+static constexpr unsigned char ANT_PARENT_ANN_STATUS_NOT_FOUND = 1;
+static constexpr unsigned char ANT_PARENT_ANN_STATUS_IS_ROOT = 2;
+
+struct RespondAntParentAnnHeader
+{
+    unsigned int parentRefTick;
+    unsigned int parentRefSolutionIndexInTick;
+    unsigned int annSizeBytes;
+    unsigned char status;
+    unsigned char padding[3];
+};
+static_assert(sizeof(RespondAntParentAnnHeader) == 16, "RespondAntParentAnnHeader unexpected size");
 
 // Actual miner software will modify the strategy accordingly
 // Demo is greedy exploration rate: 1 in this many mining rounds extends a random resolved
@@ -370,6 +393,48 @@ static bool queryIdentityTree(ServerSocket& sock, const unsigned char* signingSu
     return true;
 }
 
+// Fetch one stored node's ANN back from the node (Operator signed message).
+// Returns 1 with outAnn filled, 0 when the node answered without a usable ANN, -1 on network failure
+static int queryParentAnn(ServerSocket& sock, const unsigned char* operatorSubseed, const unsigned char* operatorPublicKey,
+    unsigned int refTick, unsigned int refSolutionIndexInTick, AntMinerT::ANN& outAnn)
+{
+    struct
+    {
+        RequestResponseHeader header;
+        RequestAntParentAnn request;
+        unsigned char signature[64];
+    } packet;
+    packet.header.setSize(sizeof(packet));
+    packet.header.randomizeDejavu();
+    packet.header.setType(REQUEST_ANT_PARENT_ANN);
+    packet.request.parentRefTick = refTick;
+    packet.request.parentRefSolutionIndexInTick = refSolutionIndexInTick;
+    unsigned char digest[32];
+    KangarooTwelve((const unsigned char*)&packet.request, sizeof(RequestAntParentAnn), digest, 32);
+    alignas(32) unsigned char sig[64];
+    sign(operatorSubseed, operatorPublicKey, digest, sig);
+    memcpy(packet.signature, sig, 64);
+    if (!sock.sendData((char*)&packet, sizeof(packet)))
+    {
+        return -1;
+    }
+    char buffer[sizeof(RespondAntParentAnnHeader) + sizeof(AntMinerT::ANN)];
+    const int received = waitForResponse(sock, RESPOND_ANT_PARENT_ANN, buffer, sizeof(buffer));
+    if (received < (int)sizeof(RespondAntParentAnnHeader))
+    {
+        return -1;
+    }
+    const RespondAntParentAnnHeader* respHeader = (const RespondAntParentAnnHeader*)buffer;
+    if (respHeader->status != ANT_PARENT_ANN_STATUS_OK
+        || respHeader->annSizeBytes != sizeof(AntMinerT::ANN)
+        || received < (int)(sizeof(RespondAntParentAnnHeader) + sizeof(AntMinerT::ANN)))
+    {
+        return 0;
+    }
+    memcpy(&outAnn, buffer + sizeof(RespondAntParentAnnHeader), sizeof(AntMinerT::ANN));
+    return 1;
+}
+
 // One node of this miner's own tree (isolated per-identity trees)
 struct OwnNode
 {
@@ -380,6 +445,8 @@ struct OwnNode
     unsigned int parentTick;          // this node's parentRef
     unsigned int parentSolutionIndexInTick;
     bool refKnown;                          // selfRef learned from the node's identity-tree listing
+    bool lutChecked;                        // local ANN verified once against the node's stored ANN
+    bool lutMismatch;                       // stored ANN differed; never extend this node
     unsigned int resolveAttempts;           // resolve cycles seen while still unresolved (mismatch detector)
     unsigned int selfTick;
     unsigned int selfSolutionIndexInTick;
@@ -613,20 +680,26 @@ static void mineWorker(const unsigned char* pool, const unsigned char* computorP
 
 int main(int argc, char* argv[])
 {
-    if (argc < 5 || argc > 9)
+    if (argc < 5 || argc > 11)
     {
-        printf("Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Threads] --task FILE\n");
+        printf("Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Threads] --task FILE [--operator SEED]\n");
         printf("  Threads:     mining thread count; default = hardware cores - 1\n");
         printf("  --task FILE: the pinned bpp9000 task file (required)\n");
+        printf("  --operator SEED: node operator seed for identity-tree queries; default = Signing Seed\n");
         return 1;
     }
     int requestedThreads = 0;
     const char* taskFilePath = nullptr;
+    const char* operatorSeed = nullptr;
     for (int i = 5; i < argc; i++)
     {
         if (strcmp(argv[i], "--task") == 0 && i + 1 < argc)
         {
             taskFilePath = argv[++i];
+        }
+        else if (strcmp(argv[i], "--operator") == 0 && i + 1 < argc)
+        {
+            operatorSeed = argv[++i];
         }
         else
         {
@@ -649,6 +722,21 @@ int main(int argc, char* argv[])
     getSubseedFromSeed((unsigned char*)signingSeed, signingSubseed);
     getPrivateKeyFromSubSeed(signingSubseed, signingPrivateKey);
     getPublicKeyFromPrivateKey(signingPrivateKey, signingPublicKey);
+
+    unsigned char operatorSubseed[32];
+    unsigned char operatorPublicKey[32];
+    if (operatorSeed != nullptr)
+    {
+        unsigned char operatorPrivateKey[32];
+        getSubseedFromSeed((unsigned char*)operatorSeed, operatorSubseed);
+        getPrivateKeyFromSubSeed(operatorSubseed, operatorPrivateKey);
+        getPublicKeyFromPrivateKey(operatorPrivateKey, operatorPublicKey);
+    }
+    else
+    {
+        memcpy(operatorSubseed, signingSubseed, 32);
+        memcpy(operatorPublicKey, signingPublicKey, 32);
+    }
 
     printf("AntMiner is launched. Connecting to %s:%d, mining for %s\n", nodeIp, nodePort, miningID);
 
@@ -739,6 +827,7 @@ int main(int argc, char* argv[])
     unsigned long long staleSkipped = 0;   // hits dropped because the anchor left the freshness window before submit
     unsigned int maxSubmitAge = 0;          // worst anchor age (ticks) among submitted solutions, vs freshnessWindow
     auto lastResolveTime = std::chrono::steady_clock::now();
+    auto lastLutCheckTime = std::chrono::steady_clock::now();
 
     unsigned int lastAnchorCandidateTick = 0xFFFFFFFFU;
     unsigned int cachedAnchorTick = 0xFFFFFFFFU;
@@ -752,7 +841,7 @@ int main(int argc, char* argv[])
         const OwnNode* parentNode = NULL;
         for (const OwnNode& node : ownNodes)
         {
-            if (node.refKnown && (parentNode == NULL || node.score < parentNode->score))
+            if (node.refKnown && !node.lutMismatch && (parentNode == NULL || node.score < parentNode->score))
             {
                 parentNode = &node;
             }
@@ -768,7 +857,7 @@ int main(int argc, char* argv[])
             if (!ownNodes.empty())
             {
                 const OwnNode& pick = ownNodes[(exploreRoll >> 8) % ownNodes.size()];
-                if (pick.refKnown)
+                if (pick.refKnown && !pick.lutMismatch)
                 {
                     parentNode = &pick;
                 }
@@ -829,9 +918,9 @@ int main(int argc, char* argv[])
             // node-health readout: a large misaligned share means the node may not match the network.
             unsigned long long digestPrefix = 0;
             memcpy(&digestPrefix, cachedAnchorDigest, 8);
-            printf("Anchor tick %u digest=%llu (votes aligned %u, misaligned %u)\n",
-                cachedAnchorTick, digestPrefix,
-                (unsigned int)tickInfo.numberOfAlignedVotes, (unsigned int)tickInfo.numberOfMisalignedVotes);
+            // printf("Anchor tick %u digest=%llu (votes aligned %u, misaligned %u)\n",
+            //     cachedAnchorTick, digestPrefix,
+            //     (unsigned int)tickInfo.numberOfAlignedVotes, (unsigned int)tickInfo.numberOfMisalignedVotes);
         }
 
         {
@@ -898,6 +987,8 @@ int main(int argc, char* argv[])
                 node.parentTick = r.parentTick;
                 node.parentSolutionIndexInTick = r.parentSolutionIndexInTick;
                 node.refKnown = false;
+                node.lutChecked = false;
+                node.lutMismatch = false;
                 node.resolveAttempts = 0;
                 node.selfTick = 0;
                 node.selfSolutionIndexInTick = 0;
@@ -921,6 +1012,55 @@ int main(int argc, char* argv[])
         // Periodically resolve our submitted nodes' selfRefs from the node's listing and
         // report tree growth (the proof-of-working readout).
         const auto now = std::chrono::steady_clock::now();
+
+        // Verify each resolved own node's local ANN against the node's stored ANN, once per node.
+        // A mismatch means children mined from the local copy would score differently on-chain,
+        // wasting work and deposits, so the node is excluded from parent selection.
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLutCheckTime).count() >= 60)
+        {
+            lastLutCheckTime = now;
+            unsigned int attempted = 0;
+            unsigned int checkedNow = 0;
+            unsigned int mismatches = 0;
+            unsigned int unavailable = 0;
+            bool netFailed = false;
+            for (OwnNode& node : ownNodes)
+            {
+                if (!node.refKnown || node.lutChecked)
+                {
+                    continue;
+                }
+                attempted++;
+                AntMinerT::ANN storedAnn;
+                const int result = queryParentAnn(sock, operatorSubseed, operatorPublicKey,
+                    node.selfTick, node.selfSolutionIndexInTick, storedAnn);
+                if (result < 0)
+                {
+                    netFailed = true;
+                    break;
+                }
+                if (result == 0)
+                {
+                    unavailable++;
+                    continue;
+                }
+                node.lutChecked = true;
+                checkedNow++;
+                if (memcmp(&node.ann, &storedAnn, sizeof(AntMinerT::ANN)) != 0)
+                {
+                    node.lutMismatch = true;
+                    mismatches++;
+                    printf("WARNING: LUT mismatch for own node (tick %u, index %u, score %u) - local ANN differs from the node's stored ANN, excluded from parent selection\n",
+                        node.selfTick, node.selfSolutionIndexInTick, node.score);
+                }
+            }
+            if (attempted)
+            {
+                printf("LUT check: attempted %u, verified %u, mismatched %u, unavailable %u%s\n",
+                    attempted, checkedNow, mismatches, unavailable, netFailed ? ", aborted on network failure" : "");
+            }
+        }
+
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastResolveTime).count() >= 10)
         {
             lastResolveTime = now;
@@ -931,7 +1071,7 @@ int main(int argc, char* argv[])
             do
             {
                 unsigned int nextIndex = 0;
-                if (!queryIdentityTree(sock, signingSubseed, signingPublicKey, computorPublicKey, fromIndex, entries, nextIndex))
+                if (!queryIdentityTree(sock, operatorSubseed, operatorPublicKey, computorPublicKey, fromIndex, entries, nextIndex))
                 {
                     queryOk = false;
                     break;

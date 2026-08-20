@@ -122,13 +122,15 @@ The node still owns what only it can: the epoch context (root seed, threshold, f
 `AntMiner` builds alongside `Qiner` from the same CMake / `Qiner.sln` (target `AntMiner`).
 
 ```
-./AntMiner <Node IP> <Node Port> <MiningID> <Signing Seed> [Threads] --task <task file>
+./AntMiner <Node IP> <Node Port> <MiningID> <Signing Seed> [Threads] --task <task file> [--operator SEED]
 ```
 There is **no Mining Seed argument** (unlike the Standalone `Qiner`): the pool seed is the epoch spectrum digest, which `AntMiner` reads from the node's epoch context - so it cannot mine a wrong or stale pool by hand. `--task` is required and must be the epoch's pinned task file; `AntMiner` checks its topology/data hashes against the node's canonical hashes and refuses to mine on a mismatch (a wrong task wastes work and forfeits deposits).
+- **Signing Seed** signs the solution `BROADCAST_MESSAGE`s. Its identity must hold enough QUs for message dissemination (`MESSAGE_DISSEMINATION_THRESHOLD`) and must not be the MiningID itself (the node treats a self-signed message as encrypted).
+- **`--operator SEED`** signs the identity-tree queries (`REQUEST_ANT_IDENTITY_TREE`).
 
 Example:
 ```
-./AntMiner 192.168.1.2 31841 BZBQ...WLZBQEXK aaaa...aaa 8 --task task_bpp9000.bin
+./AntMiner 192.168.1.2 31841 BZBQ...WLZBQEXK aaaa...aaa 8 --task task_bpp9000.bin --operator bbbb...bbb
 ```
 
 ## The mining loop
@@ -143,6 +145,7 @@ What `AntMiner` does each round:
 6. **Search** - random canonical nonce, `computeScoreFromParent(parentLUT, pubkey, nonce, anchorDigest)`; keep a hit when `score <= threshold` and `score < parentScore`.
 7. **Submit** - only if the anchor is still inside the freshness window (else drop as stale) and the parent is under its child cap. Sent as a `BROADCAST_MESSAGE` whose decrypted `gammingKey[0] == 3` (`MESSAGE_TYPE_ANT_SOLUTION`); payload = parent ref + anchor tick + claimed score + nonce.
 8. **Resolve** - every ~10 s, read your own tree back (operator-signed `REQUEST_ANT_IDENTITY_TREE`), learn each submitted node's self-ref (a child can only extend a parent whose ref is known), and read tree growth. A node still not on-chain after 3 resolve cycles warns of a likely **anchor-digest mismatch** - compare the printed `Anchor tick N digest=` with the node's F3 line.
+9. **LUT self-check** - every 60 s, fetch each resolved own node's stored ANN back once (operator-signed `REQUEST_ANT_PARENT_ANN`) and compare it byte-for-byte with the local copy; a node is checked only once, so the cost is one fetch per accepted solution. On mismatch the node is excluded from parent selection - children mined from a wrong local LUT would score differently on-chain, wasting work and forfeiting deposits.
 
 ## Canonical ant nonce
 
