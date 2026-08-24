@@ -145,7 +145,9 @@ What `AntMiner` does each round:
 6. **Search** - random canonical nonce, `computeScoreFromParent(parentLUT, pubkey, nonce, anchorDigest)`; keep a hit when `score <= threshold` and `score < parentScore`.
 7. **Submit** - only if the anchor is still inside the freshness window (else drop as stale) and the parent is under its child cap. Sent as a `BROADCAST_MESSAGE` whose decrypted `gammingKey[0] == 3` (`MESSAGE_TYPE_ANT_SOLUTION`); payload = parent ref + anchor tick + claimed score + nonce.
 8. **Resolve** - every ~10 s, read your own tree back (operator-signed `REQUEST_ANT_IDENTITY_TREE`), learn each submitted node's self-ref (a child can only extend a parent whose ref is known), and read tree growth. A node still not on-chain after 3 resolve cycles warns of a likely **anchor-digest mismatch** - compare the printed `Anchor tick N digest=` with the node's F3 line.
-9. **LUT self-check** - every 60 s, fetch each resolved own node's stored ANN back once (operator-signed `REQUEST_ANT_PARENT_ANN`) and compare it byte-for-byte with the local copy; a node is checked only once, so the cost is one fetch per accepted solution. On mismatch the node is excluded from parent selection - children mined from a wrong local LUT would score differently on-chain, wasting work and forfeiting deposits.
+9. **LUT self-check** - every 60 s, fetch each resolved own node's stored ANN back once (operator-signed `REQUEST_ANT_PARENT_ANN`) and compare it with the local copy; a node is checked only once, so the cost is one fetch per accepted solution. On mismatch the node is excluded from parent selection - children mined from a wrong local LUT would score differently on-chain, wasting work and forfeiting deposits.
+
+**ANN layout note.** The node's canonical ANN bytes store the LUT rows of the **non-input neurons in ascending index, densely** (row `k` = neuron `updatedNeuronIndices[k]`, tail rows zero). This miner stores rows by absolute neuron index, so ANN bytes exchanged with a node must be converted through `updatedNeuronIndices` - never compared directly. Full byte map: core `doc/ant_colony_mining.md`, section 2.7(c).
 
 ## Canonical ant nonce
 

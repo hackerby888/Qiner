@@ -393,10 +393,15 @@ static bool queryIdentityTree(ServerSocket& sock, const unsigned char* signingSu
     return true;
 }
 
-// Fetch one stored node's ANN back from the node (Operator signed message).
-// Returns 1 with outAnn filled, 0 when the node answered without a usable ANN, -1 on network failure
+// The node's canonical ANN wire form: LUT rows only, row k = neuron updatedNeuronIndices[k]
+// (dense by updated-neuron position). This miner's ANN struct carries neuron states and keeps LUT
+// rows at absolute neuron indices, so wire bytes and local bytes are never comparable directly.
+static constexpr unsigned long long CANONICAL_ANN_BYTES = AntMinerT::maxNumberOfNeurons * AntMinerT::lutSize;
+
+// Fetch one stored node's canonical ANN LUT back from the node (Operator signed message).
+// Returns 1 with outCanonicalLut filled, 0 when the node answered without a usable ANN, -1 on network failure
 static int queryParentAnn(ServerSocket& sock, const unsigned char* operatorSubseed, const unsigned char* operatorPublicKey,
-    unsigned int refTick, unsigned int refSolutionIndexInTick, AntMinerT::ANN& outAnn)
+    unsigned int refTick, unsigned int refSolutionIndexInTick, unsigned char* outCanonicalLut)
 {
     struct
     {
@@ -418,7 +423,7 @@ static int queryParentAnn(ServerSocket& sock, const unsigned char* operatorSubse
     {
         return -1;
     }
-    char buffer[sizeof(RespondAntParentAnnHeader) + sizeof(AntMinerT::ANN)];
+    char buffer[sizeof(RespondAntParentAnnHeader) + CANONICAL_ANN_BYTES];
     const int received = waitForResponse(sock, RESPOND_ANT_PARENT_ANN, buffer, sizeof(buffer));
     if (received < (int)sizeof(RespondAntParentAnnHeader))
     {
@@ -426,13 +431,28 @@ static int queryParentAnn(ServerSocket& sock, const unsigned char* operatorSubse
     }
     const RespondAntParentAnnHeader* respHeader = (const RespondAntParentAnnHeader*)buffer;
     if (respHeader->status != ANT_PARENT_ANN_STATUS_OK
-        || respHeader->annSizeBytes != sizeof(AntMinerT::ANN)
-        || received < (int)(sizeof(RespondAntParentAnnHeader) + sizeof(AntMinerT::ANN)))
+        || respHeader->annSizeBytes != CANONICAL_ANN_BYTES
+        || received < (int)(sizeof(RespondAntParentAnnHeader) + CANONICAL_ANN_BYTES))
     {
         return 0;
     }
-    memcpy(&outAnn, buffer + sizeof(RespondAntParentAnnHeader), sizeof(AntMinerT::ANN));
+    memcpy(outCanonicalLut, buffer + sizeof(RespondAntParentAnnHeader), CANONICAL_ANN_BYTES);
     return 1;
+}
+
+// Compare this miner's neuron-indexed LUT rows against the node's canonical bytes through the
+// updated-neuron mapping. Only the live rows are compared; the canonical tail is padding.
+static bool annMatchesCanonicalLut(const AntMinerT& m, const AntMinerT::ANN& local, const unsigned char* canonicalLut)
+{
+    for (unsigned long long k = 0; k < m.numberOfUpdatedNeurons; k++)
+    {
+        const unsigned long long n = m.updatedNeuronIndices[k];
+        if (memcmp(&local.lut[n * AntMinerT::lutSize], &canonicalLut[k * AntMinerT::lutSize], AntMinerT::lutSize) != 0)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 // One node of this miner's own tree (isolated per-identity trees)
@@ -1031,9 +1051,9 @@ int main(int argc, char* argv[])
                     continue;
                 }
                 attempted++;
-                AntMinerT::ANN storedAnn;
+                unsigned char storedLut[CANONICAL_ANN_BYTES];
                 const int result = queryParentAnn(sock, operatorSubseed, operatorPublicKey,
-                    node.selfTick, node.selfSolutionIndexInTick, storedAnn);
+                    node.selfTick, node.selfSolutionIndexInTick, storedLut);
                 if (result < 0)
                 {
                     netFailed = true;
@@ -1046,7 +1066,7 @@ int main(int argc, char* argv[])
                 }
                 node.lutChecked = true;
                 checkedNow++;
-                if (memcmp(&node.ann, &storedAnn, sizeof(AntMinerT::ANN)) != 0)
+                if (!annMatchesCanonicalLut(*miner, node.ann, storedLut))
                 {
                     node.lutMismatch = true;
                     mismatches++;
