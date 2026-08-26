@@ -1,5 +1,6 @@
 // AntMiner: ant-colony reference miner.
 // Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Threads] --task FILE
+//        AntMiner --qatum [Qatum IP] [Port] [Wallet] [Worker] [Threads] --task FILE
 
 #include <chrono>
 #include <thread>
@@ -15,9 +16,12 @@
 #include <signal.h>
 #endif
 
+#include <string>
+
 #include "score_bpp9000.h"
 #include "keyUtils.h"
 #include "network.h"
+#include "qatum.h"
 
 // Wire protocol (mirrors core/src/network_messages)
 
@@ -698,11 +702,485 @@ static void mineWorker(const unsigned char* pool, const unsigned char* computorP
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Qatum pool mode
+//
+// A pool worker mines exactly the same walk as the solo miner, but it holds no keys and talks to no
+// node. The pool supplies the seed, the computor to mine for, the anchor and its digest, the parent
+// to extend, and the threshold; the worker returns nonce + score. The pool re-scores every hit and
+// broadcasts the survivors to the computor that owns the tree, so a worker can neither forfeit a
+// deposit nor put anything on chain.
+// ---------------------------------------------------------------------------------------------
+
+struct QatumJob
+{
+    std::string jobId;
+    std::string computorId;
+    std::string seed;
+    unsigned char pubkey[32];
+    unsigned char anchorDigest[32];
+    unsigned int anchorTick;
+    unsigned int threshold;
+    unsigned int parentTick;
+    unsigned int parentSolutionIndexInTick;
+    unsigned int parentScore;
+    // The network to mutate from, already in this miner's absolute-neuron-index layout. Empty means
+    // the identity's virtual root, which the worker derives itself.
+    std::vector<unsigned char> parentLut;
+    // Bumped when the seed changes, which is the only thing that invalidates a worker's random2 pool.
+    unsigned long long poolGeneration;
+    bool valid;
+};
+static QatumJob gQatumJob;
+static std::mutex gQatumJobMutex;
+
+struct QatumHit
+{
+    std::string jobId;
+    std::string computorId;
+    std::string seed;
+    unsigned char nonce[32];
+    unsigned int score;
+};
+static std::vector<QatumHit> gQatumHits;
+static std::mutex gQatumHitsMutex;
+
+static std::vector<unsigned char> gQatumPool;
+static std::mutex gQatumPoolMutex;
+static unsigned long long gQatumPoolGeneration = 0;
+
+// Same walk as mineWorker, but the pool and the identity can both change under it mid-run, so the
+// root and the random2 pool are rebuilt when the job says they moved rather than captured at start.
+static void qatumMineWorker()
+{
+    auto miner = std::make_unique<AntMinerT>();
+    miner->loadTaskFromMemory(gTopoBlock, gDataBlock);
+
+    std::vector<unsigned char> localPool;
+    unsigned long long localPoolGeneration = 0;
+    AntMinerT::ANN root;
+    std::string rootComputorId;
+
+    while (!state)
+    {
+        QatumJob job;
+        {
+            std::lock_guard<std::mutex> guard(gQatumJobMutex);
+            job = gQatumJob;
+        }
+        if (!job.valid)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        // A job naming a parent must carry that parent's network. Without it the only thing this
+        // worker could do is mine from the root, which would produce a score the pool recomputes
+        // differently - so wait for a usable job instead of guessing.
+        const bool isRootJob = job.parentTick == ROOT_TICK
+            && job.parentSolutionIndexInTick == ROOT_INDEX_IN_TICK;
+        if (!isRootJob && job.parentLut.size() != CANONICAL_ANN_BYTES)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        if (job.poolGeneration != localPoolGeneration)
+        {
+            {
+                std::lock_guard<std::mutex> guard(gQatumPoolMutex);
+                localPool = gQatumPool;
+                localPoolGeneration = job.poolGeneration;
+            }
+            if (localPool.empty())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            miner->setPool(localPool.data());
+            // The root is drawn from the pool, so a new pool invalidates it too.
+            rootComputorId.clear();
+        }
+
+        if (isRootJob && rootComputorId != job.computorId)
+        {
+            miner->deriveRootANN(job.pubkey, root);
+            rootComputorId = job.computorId;
+        }
+
+        unsigned char nonce[32];
+        _rdrand64_step((unsigned long long*)&nonce[0]);
+        _rdrand64_step((unsigned long long*)&nonce[8]);
+        _rdrand64_step((unsigned long long*)&nonce[16]);
+        _rdrand64_step((unsigned long long*)&nonce[24]);
+        nonce[0] = 1;                                                                          // AlgoType::Bpp9000
+        nonce[1] = (unsigned char)((nonce[1] % score_bpp9000::MAX_LUT_ENTRIES_PER_STEP) + 1);   // L in [1, 10]
+        nonce[2] = (unsigned char)(nonce[2] % (score_bpp9000::NUMBER_OF_MUTATIONS + 1));        // K in [0, 100]
+
+        const unsigned char* parentLut = isRootJob ? root.lut : job.parentLut.data();
+        const unsigned int score = miner->computeScoreFromParent(parentLut, job.pubkey, nonce, job.anchorDigest);
+        gIterations++;
+
+        // Lower is better. The root records the worst possible score, so at depth 1 the threshold is
+        // the only real gate; the parent comparison becomes load-bearing once the pool walks the tree.
+        if (score <= job.threshold && score < job.parentScore)
+        {
+            QatumHit hit;
+            hit.jobId = job.jobId;
+            hit.computorId = job.computorId;
+            hit.seed = job.seed;
+            memcpy(hit.nonce, nonce, 32);
+            hit.score = score;
+            std::lock_guard<std::mutex> guard(gQatumHitsMutex);
+            gQatumHits.push_back(hit);
+        }
+    }
+}
+
+// The pool sends a parent network in the node's CANONICAL layout: LUT rows dense by updated-neuron
+// position, row k belonging to neuron updatedNeuronIndices[k]. This miner indexes rows by absolute
+// neuron number instead, so the bytes have to be moved through that mapping. Comparing or using them
+// directly would score a different network while looking perfectly valid - the failure is silent, and
+// every solution built on it forfeits the computor's deposit.
+static bool canonicalLutToLocal(const AntMinerT& miner, const std::vector<unsigned char>& canonical,
+    std::vector<unsigned char>& out)
+{
+    if (canonical.size() != CANONICAL_ANN_BYTES)
+    {
+        return false;
+    }
+
+    out.assign(AntMinerT::maxNumberOfNeurons * AntMinerT::lutSize, 0);
+    for (unsigned long long k = 0; k < miner.numberOfUpdatedNeurons; k++)
+    {
+        const unsigned long long n = miner.updatedNeuronIndices[k];
+        memcpy(&out[n * AntMinerT::lutSize], &canonical[k * AntMinerT::lutSize], AntMinerT::lutSize);
+    }
+    return true;
+}
+
+// The coordinator has no scorer of its own, so it borrows one purely for the neuron mapping, which
+// comes from the task and is identical for every miner this epoch.
+static std::unique_ptr<AntMinerT> gQatumLayoutMiner;
+
+static void rebuildQatumPool(const std::string& seedHex, unsigned char* spectrumDigest)
+{
+    std::lock_guard<std::mutex> guard(gQatumPoolMutex);
+    gQatumPool.resize(POOL_VEC_PADDING_SIZE);
+    generateRandom2Pool(spectrumDigest, gQatumPool.data());
+    gQatumPoolGeneration++;
+    printf("Pool rebuilt from seed %s (generation %llu)\n", seedHex.c_str(), gQatumPoolGeneration);
+}
+
+static int runQatumMiner(const char* host, int port, const std::string& wallet,
+    const std::string& workerName, int requestedThreads, const char* taskFilePath)
+{
+    if (!taskFilePath || !loadBpp9000TaskFile(taskFilePath))
+    {
+        printf("A --task FILE is required for mining.\n");
+        return 1;
+    }
+
+    qatum::Client client;
+    if (!client.connect(host, port))
+    {
+        printf("Failed to connect to the qatum server %s:%d\n", host, port);
+        return 1;
+    }
+    if (!client.subscribe(wallet, workerName))
+    {
+        printf("Failed to subscribe to the qatum server\n");
+        return 1;
+    }
+    printf("Connected to qatum %s:%d as %s/%s\n", host, port, wallet.c_str(), workerName.c_str());
+
+    unsigned int threadCount = std::thread::hardware_concurrency();
+    threadCount = (threadCount > 1) ? (threadCount - 1) : 1;
+    if (requestedThreads > 0)
+    {
+        threadCount = (unsigned int)requestedThreads;
+    }
+
+    // Only used for its updatedNeuronIndices mapping when converting a parent network.
+    gQatumLayoutMiner = std::make_unique<AntMinerT>();
+    gQatumLayoutMiner->loadTaskFromMemory(gTopoBlock, gDataBlock);
+
+    gQatumJob = QatumJob();
+    gQatumJob.valid = false;
+    std::vector<std::thread> workers;
+    for (unsigned int t = 0; t < threadCount; t++)
+    {
+        workers.emplace_back(qatumMineWorker);
+    }
+    printf("%u mining threads started.\n", threadCount);
+
+    std::string currentComputorId;
+    std::string currentSeed;
+    unsigned long long submitted = 0;
+    unsigned long long lastIterations = 0;
+    auto lastReportTime = std::chrono::steady_clock::now();
+
+    while (!state)
+    {
+        if (!client.connected)
+        {
+            printf("Qatum connection lost, reconnecting...\n");
+            {
+                std::lock_guard<std::mutex> guard(gQatumJobMutex);
+                gQatumJob.valid = false;
+            }
+            client.close();
+            while (!state && !(client.connect(host, port) && client.subscribe(wallet, workerName)))
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+            continue;
+        }
+
+        std::string line;
+        while (client.poll(line) && !line.empty())
+        {
+            int id = 0;
+            if (!qatum::getInt(line, "id", id))
+            {
+                continue;
+            }
+
+            if (id == qatum::EVENT_SUBSCRIBE)
+            {
+                if (!qatum::isTrue(line, "result"))
+                {
+                    std::string error;
+                    qatum::getString(line, "error", error);
+                    printf("Qatum refused the subscription: %s\n", error.c_str());
+                    state = 1;
+                    break;
+                }
+
+                // The pool's node scores against its own pinned task. Mining a different one wastes
+                // every walk and forfeits the computor's deposit on every submission, so stop here.
+                std::string topologyHash, dataHash;
+                if (qatum::getString(line, "topologyHash", topologyHash)
+                    && qatum::getString(line, "dataHash", dataHash))
+                {
+                    if (topologyHash != qatum::toHex(gTaskTopoHash, 32)
+                        || dataHash != qatum::toHex(gTaskDataHash, 32))
+                    {
+                        printf("TASK MISMATCH: your --task file is not the one the pool scores against.\n");
+                        printf("  topology block: %s\n", topologyHash != qatum::toHex(gTaskTopoHash, 32) ? "DIFFERS" : "ok");
+                        printf("  data block    : %s\n", dataHash != qatum::toHex(gTaskDataHash, 32) ? "DIFFERS" : "ok");
+                        state = 1;
+                        break;
+                    }
+                    printf("Task matches the pool's canonical hashes.\n");
+                }
+            }
+            else if (id == qatum::EVENT_NEW_COMPUTOR_ID)
+            {
+                std::string computorId;
+                if (qatum::getString(line, "computorId", computorId) && computorId.size() == 60)
+                {
+                    currentComputorId = computorId;
+                    printf("Mining for computor %s\n", currentComputorId.c_str());
+                }
+            }
+            else if (id == qatum::EVENT_NEW_SEED)
+            {
+                std::string seed;
+                unsigned char spectrumDigest[32];
+                if (qatum::getString(line, "seed", seed) && qatum::parseHex(seed, spectrumDigest, 32)
+                    && seed != currentSeed)
+                {
+                    currentSeed = seed;
+                    rebuildQatumPool(seed, spectrumDigest);
+                }
+            }
+            else if (id == qatum::EVENT_NEW_JOB)
+            {
+                QatumJob job;
+                memset(&job, 0, sizeof(job));
+                std::string anchorDigest;
+
+                const bool parsed =
+                    qatum::getString(line, "jobId", job.jobId)
+                    && qatum::getString(line, "computorId", job.computorId)
+                    && qatum::getString(line, "seed", job.seed)
+                    && qatum::getString(line, "anchorDigest", anchorDigest)
+                    && qatum::parseHex(anchorDigest, job.anchorDigest, 32)
+                    && qatum::getUInt(line, "anchorTick", job.anchorTick)
+                    && qatum::getUInt(line, "threshold", job.threshold)
+                    && qatum::getUInt(line, "parentTick", job.parentTick)
+                    && qatum::getUInt(line, "parentSolutionIndexInTick", job.parentSolutionIndexInTick)
+                    && qatum::getUInt(line, "parentScore", job.parentScore)
+                    && job.computorId.size() == 60;
+
+                if (parsed)
+                {
+                    getPublicKeyFromIdentity((char*)job.computorId.c_str(), job.pubkey);
+                }
+
+                if (!parsed)
+                {
+                    printf("Ignoring a malformed job packet.\n");
+                    continue;
+                }
+
+                // The seed rides on the job too, so a job for a pool we have not built yet waits
+                // rather than mining against the previous epoch's pool.
+                if (job.seed != currentSeed)
+                {
+                    unsigned char spectrumDigest[32];
+                    if (!qatum::parseHex(job.seed, spectrumDigest, 32))
+                    {
+                        printf("Ignoring a job with an unusable seed.\n");
+                        continue;
+                    }
+                    currentSeed = job.seed;
+                    rebuildQatumPool(job.seed, spectrumDigest);
+                }
+
+                // A job that names a parent must carry that parent's network; one that does not is
+                // a root job. Anything in between is malformed and is dropped rather than mined.
+                const bool isRootJob = job.parentTick == ROOT_TICK
+                    && job.parentSolutionIndexInTick == ROOT_INDEX_IN_TICK;
+                std::string parentAnnHex;
+                qatum::getString(line, "parentAnnHex", parentAnnHex);
+
+                if (!isRootJob)
+                {
+                    std::vector<unsigned char> canonical(CANONICAL_ANN_BYTES);
+                    if (parentAnnHex.size() != CANONICAL_ANN_BYTES * 2
+                        || !qatum::parseHex(parentAnnHex, canonical.data(), CANONICAL_ANN_BYTES)
+                        || !canonicalLutToLocal(*gQatumLayoutMiner, canonical, job.parentLut))
+                    {
+                        printf("Ignoring a job with an unusable parent network.\n");
+                        continue;
+                    }
+                }
+
+                currentComputorId = job.computorId;
+                {
+                    std::lock_guard<std::mutex> poolGuard(gQatumPoolMutex);
+                    job.poolGeneration = gQatumPoolGeneration;
+                }
+                job.valid = true;
+
+                {
+                    std::lock_guard<std::mutex> guard(gQatumJobMutex);
+                    gQatumJob = job;
+                }
+                unsigned int depth = 0;
+                qatum::getUInt(line, "depth", depth);
+                printf("Job %s: depth %u, anchor %u, threshold %u, %s\n",
+                    job.jobId.c_str(), depth, job.anchorTick, job.threshold,
+                    isRootJob
+                        ? "extending the root"
+                        : ("extending " + std::to_string(job.parentTick) + ":"
+                           + std::to_string(job.parentSolutionIndexInTick)
+                           + " (score " + std::to_string(job.parentScore) + ")").c_str());
+            }
+            else if (id == qatum::EVENT_SUBMIT)
+            {
+                if (!qatum::isTrue(line, "result"))
+                {
+                    std::string error;
+                    qatum::getString(line, "error", error);
+                    printf("Submit rejected: %s\n", error.c_str());
+                }
+            }
+        }
+
+        std::vector<QatumHit> hits;
+        {
+            std::lock_guard<std::mutex> guard(gQatumHitsMutex);
+            hits.swap(gQatumHits);
+        }
+        for (size_t i = 0; i < hits.size(); i++)
+        {
+            const QatumHit& hit = hits[i];
+            if (!client.submit(hit.jobId, hit.computorId, hit.seed, hit.nonce, hit.score))
+            {
+                // The connection dropped mid-batch; keep the rest for the reconnect rather than
+                // discarding walks that are still inside the anchor's freshness window.
+                std::lock_guard<std::mutex> guard(gQatumHitsMutex);
+                gQatumHits.insert(gQatumHits.end(), hits.begin() + i, hits.end());
+                break;
+            }
+            submitted++;
+            printf("Submitted: score %u\n", hit.score);
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastReportTime).count();
+        if (elapsed >= 180)
+        {
+            const unsigned long long iterations = gIterations.load();
+            // Hashrate is iterations per second over the window just closed, not since launch: a
+            // long-running miner would otherwise report an average that hides a current stall.
+            const unsigned long long rate = (iterations - lastIterations) / (unsigned long long)elapsed;
+            lastIterations = iterations;
+            lastReportTime = now;
+            if (!currentComputorId.empty())
+            {
+                client.reportHashrate(currentComputorId, rate);
+            }
+            printf("| %llu iterations | %llu submitted | %llu it/s |\n", iterations, submitted, rate);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    for (std::thread& worker : workers)
+    {
+        worker.join();
+    }
+    client.close();
+    printf("AntMiner (qatum) is shut down. %llu iterations, %llu submitted.\n",
+        gIterations.load(), submitted);
+    return 0;
+}
+
 int main(int argc, char* argv[])
 {
+    // Pool mode takes a different set of arguments: the pool supplies the mining identity and holds
+    // the keys, so there is no MiningID and no signing seed to pass.
+    const bool qatumMode = (argc > 1) && (strcmp(argv[1], "--qatum") == 0);
+
+    if (qatumMode)
+    {
+        if (argc < 6)
+        {
+            printf("Usage: AntMiner --qatum [Qatum IP] [Port] [Wallet] [Worker] [Threads] --task FILE\n");
+            printf("  Wallet:      the qubic id rewards are paid to (60 characters)\n");
+            printf("  Worker:      a name for this machine, shown on the pool dashboard\n");
+            printf("  Threads:     mining thread count; default = hardware cores - 1\n");
+            printf("  --task FILE: the pinned bpp9000 task file (required)\n");
+            return 1;
+        }
+
+        int qatumThreads = 0;
+        const char* qatumTaskFilePath = nullptr;
+        for (int i = 6; i < argc; i++)
+        {
+            if (strcmp(argv[i], "--task") == 0 && i + 1 < argc)
+            {
+                qatumTaskFilePath = argv[++i];
+            }
+            else
+            {
+                qatumThreads = std::atoi(argv[i]);
+            }
+        }
+
+        consoleCtrlHandler();
+        return runQatumMiner(argv[2], std::atoi(argv[3]), argv[4], argv[5],
+            qatumThreads, qatumTaskFilePath);
+    }
+
     if (argc < 5 || argc > 11)
     {
         printf("Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Threads] --task FILE [--operator SEED]\n");
+        printf("       AntMiner --qatum [Qatum IP] [Port] [Wallet] [Worker] [Threads] --task FILE\n");
         printf("  Threads:     mining thread count; default = hardware cores - 1\n");
         printf("  --task FILE: the pinned bpp9000 task file (required)\n");
         printf("  --operator SEED: node operator seed for identity-tree queries; default = Signing Seed\n");

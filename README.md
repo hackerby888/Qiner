@@ -149,6 +149,53 @@ What `AntMiner` does each round:
 
 **ANN layout note.** The node's canonical ANN bytes store the LUT rows of the **non-input neurons in ascending index, densely** (row `k` = neuron `updatedNeuronIndices[k]`, tail rows zero). This miner stores rows by absolute neuron index, so ANN bytes exchanged with a node must be converted through `updatedNeuronIndices` - never compared directly. Full byte map: core `doc/ant_colony_mining.md`, section 2.7(c).
 
+## Mining for a Qatum pool
+
+`AntMiner --qatum` mines the same walk against a [Qatum](https://github.com/hackerby888/qatum-protocol)
+pool instead of a node. The pool holds the computor identities and the keys, so a worker carries no
+seed, signs nothing and puts nothing on chain - it receives work and returns `(nonce, score)`.
+
+```
+./AntMiner --qatum <Qatum IP> <Port> <Wallet> <Worker> [Threads] --task <task file>
+```
+
+Example:
+```
+./AntMiner --qatum server.qatum.org 7777 BZBQ...WLZBQEXK rig-01 8 --task task_bpp9000.bin
+```
+
+- **Wallet** is the qubic id your rewards are paid to; **Worker** is a name for this machine.
+- There is no MiningID and no signing seed: the pool assigns the computor to mine for and signs the
+  solution broadcast itself.
+- `--task` is still required. The pool sends its node's canonical topology/data hashes on subscribe
+  and `AntMiner` refuses to mine on a mismatch, the same gate it applies against a node directly.
+- `--operator` is ignored in pool mode: the pool owns the identity tree and its queries.
+
+What the pool supplies in place of the node queries: the epoch spectrum digest (which seeds the
+`random2` pool), the computor to mine for, the anchor tick and its digest, the parent to extend, and
+the submit threshold. Everything else - deriving the root, canonicalising the nonce, running the walk -
+is identical to solo mode, so scores are bit-identical either way.
+
+### Tree jobs
+
+A job either extends the identity's **virtual root** - which the worker derives locally, so nothing
+crosses the wire - or names a real tree node and carries that node's network as `parentAnnHex`.
+Extending an accepted node is where the score actually improves, so the pool sends one whenever it
+has a usable parent and falls back to root jobs otherwise.
+
+`AntMiner` announces `protocolVersion: 3` to say it can inherit a parent. A pool only ever hands a
+parent to a client that claims that, so an older v2 client keeps working on root jobs rather than
+mining something it would score wrongly.
+
+**The parent arrives in the node's canonical layout** - LUT rows dense by updated-neuron position,
+row `k` belonging to neuron `updatedNeuronIndices[k]` - while this miner indexes rows by absolute
+neuron number. `canonicalLutToLocal` converts between them. Skipping that conversion is silent: the
+walk runs happily on a different network, and every solution it finds is rejected on chain at the
+computor's expense. `test/bpp9000_ant_colony_test.cpp` pins the conversion against a vector produced
+by the pool's own scorer.
+
+A job that names a parent but carries no usable network is ignored rather than mined from the root.
+
 ## Canonical ant nonce
 
 `computeScoreFromParent` rejects a non-canonical nonce with `INVALID_SCORE_VALUE` (`0xFFFFFFFF`), and so does the node - a rejected score forfeits the deposit, so the miner canonicalizes every nonce before scoring.
